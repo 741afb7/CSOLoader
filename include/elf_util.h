@@ -5,21 +5,21 @@
 #include <string.h>
 #include <link.h>
 #include <sys/types.h>
-#include <pthread.h> // Added for threading primitives
+#include <pthread.h>
+#include <stdint.h>
 
 #define SHT_GNU_HASH 0x6ffffff6
 
-// Function pointer types for constructors and destructors
 typedef void (*linker_simple_func_t)(void);
 typedef void (*linker_ctor_function_t)(int, char**, char**);
 typedef void (*linker_dtor_function_t)(void);
-
 
 struct symtabs {
   char *name;
   ElfW(Sym) *sym;
 };
 
+/* TODO: Use pure struct. This looks horrible. */
 typedef struct {
   char *elf;
   void *base;
@@ -74,7 +74,24 @@ typedef struct {
   linker_simple_func_t preinit_func;
   linker_simple_func_t init_func;
   linker_simple_func_t fini_func;
+
+  const uint8_t *eh_frame;
+  size_t eh_frame_size;
+  const uint8_t *eh_frame_hdr;
+  size_t eh_frame_hdr_size;
+  const uint8_t *gcc_except_table;
+  size_t gcc_except_table_size;
+
+  #ifdef __arm__
+    const uint8_t *arm_exidx;
+    size_t arm_exidx_count;
+  #endif
 } ElfImg;
+
+struct sym_info {
+  const char *name;
+  ElfW(Addr) address;
+};
 
 void ElfImg_destroy(ElfImg *img);
 
@@ -90,11 +107,6 @@ ElfW(Addr) getSymbAddressByPrefix(ElfImg *img, const char *prefix);
 
 void *getSymbValueByPrefix(ElfImg *img, const char *prefix);
 
-
-ElfW(Addr) getSymbOffsetStrong(ElfImg *self,
-  ElfImg **deps,
-  size_t   dep_cnt,
-  const char *name,
-  unsigned char *sym_type);
+struct sym_info elf_get_symbol(ElfImg *img, uintptr_t addr);
 
 #endif /* ELF_UTIL_H */

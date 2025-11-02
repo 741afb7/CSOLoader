@@ -403,6 +403,18 @@ ElfImg *ElfImg_create(const char *elf, void *base) {
     img->symstr_offset_for_symtab = 0;
   }
 
+  /* TODO: Maybe better to use memset? */
+  img->eh_frame = NULL;
+  img->eh_frame_size = 0;
+  img->eh_frame_hdr = NULL;
+  img->eh_frame_hdr_size = 0;
+  img->gcc_except_table = NULL;
+  img->gcc_except_table_size = 0;
+  #ifdef __arm__
+    img->arm_exidx = NULL;
+    img->arm_exidx_count = 0;
+  #endif
+
   bool bias_calculated = false;
   if (img->header->e_phoff > 0 && img->header->e_phnum > 0) {
     ElfW(Phdr) *phdr = (ElfW(Phdr) *)((uintptr_t)img->header + img->header->e_phoff);
@@ -530,6 +542,25 @@ ElfImg *ElfImg_create(const char *elf, void *base) {
 
       break;
     }
+
+    /* INFO: Populate EH regions from Program Headers when possible */
+    for (int i = 0; i < img->header->e_phnum; ++i) {
+      if (phdr[i].p_type == PT_GNU_EH_FRAME) {
+        img->eh_frame_hdr = (const uint8_t *)((uintptr_t)img->base + phdr[i].p_vaddr - img->bias);
+        img->eh_frame_hdr_size = phdr[i].p_memsz;
+
+        LOGD("Found PT_GNU_EH_FRAME for %s at %p (size %zu)", img->elf, img->eh_frame_hdr, img->eh_frame_hdr_size);
+      }
+
+      #ifdef __arm__
+        if (phdr[i].p_type == PT_ARM_EXIDX) {
+          img->arm_exidx = (const uint8_t *)((uintptr_t)img->base + phdr[i].p_vaddr - img->bias);
+          img->arm_exidx_count = phdr[i].p_memsz / 8;
+
+          LOGD("Found PT_ARM_EXIDX for %s at %p (entries %zu)", img->elf, img->arm_exidx, img->arm_exidx_count);
+        }
+      #endif
+    }
   }
 
   if (!bias_calculated)
@@ -543,6 +574,43 @@ ElfImg *ElfImg_create(const char *elf, void *base) {
   if (!img->gnu_bucket_ && !img->bucket_)
     LOGW("No hash table (.gnu.hash or .hash) found in %s. Dynamic symbol lookup might be slow or fail.", elf);
 
+  /* INFO: Populate EH regions from Section Headers */
+  if (img->section_header && img->header->e_shstrndx != SHN_UNDEF && img->header->e_shstrndx < img->header->e_shnum) {
+    ElfW(Shdr) *shstrtab_hdr = img->section_header + img->header->e_shstrndx;
+    char *sec_names = offsetOf_char(img->header, shstrtab_hdr->sh_offset);
+
+    for (int i = 0; i < img->header->e_shnum; i++) {
+      ElfW(Shdr) *sh = img->section_header + i;
+      const char *sname = sec_names ? (sec_names + sh->sh_name) : NULL;
+      if (!sname) continue;
+
+      if (strcmp(sname, ".eh_frame") == 0) {
+        img->eh_frame = (const uint8_t *)((uintptr_t)img->base + sh->sh_addr - img->bias);
+        img->eh_frame_size = sh->sh_size;
+
+        LOGD("Section .eh_frame at %p (size %zu) for %s", img->eh_frame, img->eh_frame_size, img->elf);
+      } else if (strcmp(sname, ".eh_frame_hdr") == 0) {
+        img->eh_frame_hdr = (const uint8_t *)((uintptr_t)img->base + sh->sh_addr - img->bias);
+        img->eh_frame_hdr_size = sh->sh_size;
+
+        LOGD("Section .eh_frame_hdr at %p (size %zu) for %s", img->eh_frame_hdr, img->eh_frame_hdr_size, img->elf);
+      } else if (strcmp(sname, ".gcc_except_table") == 0) {
+        img->gcc_except_table = (const uint8_t *)((uintptr_t)img->base + sh->sh_addr - img->bias);
+        img->gcc_except_table_size = sh->sh_size;
+
+        LOGD("Section .gcc_except_table at %p (size %zu) for %s", img->gcc_except_table, img->gcc_except_table_size, img->elf);
+      }
+      #ifdef __arm__
+        else if (strcmp(sname, ".ARM.exidx") == 0) {
+          img->arm_exidx = (const uint8_t *)((uintptr_t)img->base + sh->sh_addr - img->bias);
+          img->arm_exidx_count = sh->sh_size / 8;
+
+          LOGD("Section .ARM.exidx at %p (entries %zu) for %s", img->arm_exidx, img->arm_exidx_count, img->elf);
+        }
+      #endif
+    }
+  }
+
   return img;
 }
 
@@ -550,7 +618,7 @@ bool _load_symtabs(ElfImg *img) {
   if (img->symtabs_) return true;
 
   if (!img->symtab_start || img->symstr_offset_for_symtab == 0 || img->symtab_count == 0) {
-    LOGE("Cannot load symtabs: .symtab section or its string table not found/valid.");
+    // LOGE("Cannot load symtabs: .symtab section or its string table not found/valid.");
 
     return false;
   }
@@ -713,9 +781,11 @@ ElfW(Addr) ElfLookup(ElfImg *restrict img, const char *restrict name, uint32_t h
   return 0;
 }
 
+bool _load_symtabs(ElfImg *img);
+
 ElfW(Addr) LinearLookup(ElfImg *img, const char *restrict name, unsigned char *sym_type) {
   if (!_load_symtabs(img)) {
-    LOGE("Failed to load symtabs for linear lookup of %s", name);
+    // LOGE("Failed to load symtabs for linear lookup of %s", name);
 
     return 0;
   }
@@ -795,43 +865,17 @@ ElfW(Addr) getSymbOffset(ElfImg *img, const char *name, unsigned char *sym_type)
 }
 
 #ifdef __aarch64__
-  /* INFO: Struct containing information about hardware capabilities used in resolver. This
-             struct information is pulled directly from the AOSP code.
-
-     SOURCES:
-      - https://android.googlesource.com/platform/bionic/+/refs/tags/android-16.0.0_r1/libc/include/sys/ifunc.h#53
-  */
   struct __ifunc_arg_t {
     unsigned long _size;
     unsigned long _hwcap;
     unsigned long _hwcap2;
   };
-
-  /* INFO: This is a constant used in the AOSP code to indicate that the struct __ifunc_arg_t
-             contains hardware capabilities.
-
-     SOURCES:
-      - https://android.googlesource.com/platform/bionic/+/refs/tags/android-16.0.0_r1/libc/include/sys/ifunc.h#74
-  */
   #define _IFUNC_ARG_HWCAP (1ULL << 62)
 #elif defined(__riscv)
-  /* INFO: Struct used in Linux RISC-V architecture to probe hardware capabilities.
-
-     SOURCES:
-      - https://android.googlesource.com/platform/bionic/+/refs/tags/android-16.0.0_r1/libc/kernel/uapi/asm-riscv/asm/hwprobe.h#10
-  */
   struct riscv_hwprobe {
     int64_t key;
     uint64_t value;
   };
-
-  /* INFO: This function is used in the AOSP code to probe hardware capabilities on RISC-V architecture
-             by calling the syscall __NR_riscv_hwprobe and passing the parameters that will filled with
-             the device hardware capabilities.
-
-     SOURCES:
-      - https://android.googlesource.com/platform/bionic/+/refs/tags/android-16.0.0_r1/libc/bionic/vdso.cpp#86
-  */
   int __riscv_hwprobe(struct riscv_hwprobe *pairs, size_t pair_count, size_t cpu_count, unsigned long *cpus, unsigned flags) {
     register long a0 __asm__("a0") = (long)pairs;
     register long a1 __asm__("a1") = pair_count;
@@ -848,27 +892,9 @@ ElfW(Addr) getSymbOffset(ElfImg *img, const char *name, unsigned char *sym_type)
 
     return -a0;
   }
-
-  /* INFO: This is a function pointer type that points how the signature of the __riscv_hwprobe
-             function is.
-
-     SOURCES:
-      - https://android.googlesource.com/platform/bionic/+/refs/tags/android-16.0.0_r1/libc/include/sys/hwprobe.h#62
-  */
   typedef int (*__riscv_hwprobe_t)(struct riscv_hwprobe *__pairs, size_t __pair_count, size_t __cpu_count, unsigned long *__cpus, unsigned __flags);
 #endif
 
-/* INFO: GNU ifuncs (indirect functions) are functions that does not execute the code by itself,
-           but instead lead to other functions that may very according to hardware capabilities,
-           or other reasons, depending of the architecture.
-
-         This function is based on AOSP's (Android Open Source Project) code, and resolves the
-           indirect symbol, leading to the correct, most appropriate for the hardware, symbol.
-
-    SOURCES: 
-     - https://android.googlesource.com/platform/bionic/+/refs/tags/android-16.0.0_r1/linker/linker.cpp#2594
-     - https://android.googlesource.com/platform/bionic/+/tags/android-16.0.0_r1/libc/bionic/bionic_call_ifunc_resolver.cpp#41
-*/
 static ElfW(Addr) handle_indirect_symbol(ElfImg *img, ElfW(Off) offset) {
   ElfW(Addr) resolver_addr = (ElfW(Addr))((uintptr_t)img->base + offset - img->bias);
 
@@ -931,4 +957,32 @@ void *getSymbValueByPrefix(ElfImg *img, const char *prefix) {
   ElfW(Addr) address = getSymbAddressByPrefix(img, prefix);
 
   return address == 0 ? NULL : *((void **)address);
+}
+
+struct sym_info elf_get_symbol(ElfImg *img, uintptr_t addr) {
+  if (!_load_symtabs(img)) {
+    return (struct sym_info){ .name = NULL, .address = 0 };
+  }
+
+  size_t valid_symtabs_amount = calculate_valid_symtabs_amount(img);
+  if (valid_symtabs_amount == 0) {
+    return (struct sym_info){ .name = NULL, .address = 0 };
+  }
+
+  for (size_t i = 0; i < valid_symtabs_amount; i++) {
+    ElfW(Sym) *sym = img->symtabs_[i].sym;
+
+    if (sym->st_value == 0 || sym->st_size == 0) {
+      continue;
+    }
+
+    ElfW(Addr) sym_start = (ElfW(Addr))((uintptr_t)img->base + sym->st_value - img->bias);
+    ElfW(Addr) sym_end = sym_start + sym->st_size;
+
+    if (addr >= sym_start && addr < sym_end) {
+      return (struct sym_info){ .name = img->symtabs_[i].name, .address = sym_start };
+    }
+  }
+
+  return (struct sym_info){ .name = NULL, .address = 0 };
 }

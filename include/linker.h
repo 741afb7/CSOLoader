@@ -27,7 +27,9 @@ struct linker {
 void *linker_load_library_manually(const char *lib_path, struct loaded_dep *dep_info);
 
 bool linker_init(struct linker *linker, ElfImg *img);
+
 void linker_destroy(struct linker *linker);
+
 bool linker_link(struct linker *linker);
 
 #endif /* LINKER_H */

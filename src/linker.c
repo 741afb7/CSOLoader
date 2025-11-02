@@ -19,6 +19,7 @@
 #include "elf_util.h"
 #include "logging.h"
 #include "sleb128.h"
+#include "backtrace-support.h"
 
 #include "linker.h"
 
@@ -237,12 +238,18 @@ bool linker_init(struct linker *linker, ElfImg *img) {
 
 void linker_destroy(struct linker *linker) {
   if (linker->is_linked) {
+    LOGD("Unregistering libraries from backtrace support");
+
     for (int i = linker->dep_count - 1; i >= 0; --i) {
       if (linker->dependencies[i].img && linker->dependencies[i].is_manual_load) {
+        unregister_eh_frame_for_library(linker->dependencies[i].img);
+        unregister_custom_library_for_backtrace(linker->dependencies[i].img);
         _linker_call_destructors(linker->dependencies[i].img);
       }
     }
 
+    unregister_eh_frame_for_library(linker->img);
+    unregister_custom_library_for_backtrace(linker->img);
     _linker_call_destructors(linker->img);
   }
 
@@ -756,6 +763,22 @@ static void _linker_process_unified_relocation(struct linker *linker, ElfImg *im
       struct linker_symbol_info sym = _linker_find_symbol_in_linker_scope(linker, sym_name);
       if (!sym.addr) {
         LOGE("Symbol '%s' not found for relocation in %s", sym_name, image->elf);
+
+        return;
+      }
+
+      if (strcmp(sym_name, "dl_iterate_phdr") == 0) {
+        LOGD("Special case for dl_iterate_phdr: using linker->img->base instead of sym.addr");
+
+        *target_addr = custom_dl_iterate_phdr;
+
+        return;
+      }
+
+      if (strcmp(sym_name, "dladdr") == 0) {
+        LOGD("Special case for dladdr: using linker->img->base instead of sym.addr");
+
+        *target_addr = custom_dladdr;
 
         return;
       }
@@ -1275,6 +1298,31 @@ struct relro_region {
 struct relro_region relro_regions[MAX_RELRO];
 size_t relro_count = 0;
 
+static void verify_exception_tables(ElfImg *img) {
+  LOGD("Verifying exception tables for %s", img->elf);
+  
+  // Check if .gcc_except_table exists and is mapped
+  if (img->gcc_except_table && img->gcc_except_table_size > 0) {
+    LOGD("  .gcc_except_table: %p (size %zu)", img->gcc_except_table, img->gcc_except_table_size);
+    
+    // Try to read first byte to verify it's mapped
+    volatile uint8_t test = *(const uint8_t*)img->gcc_except_table;
+    (void)test;
+    LOGD("  .gcc_except_table is readable");
+  } else {
+    LOGW("  No .gcc_except_table found!");
+  }
+  
+  if (img->eh_frame && img->eh_frame_size > 0) {
+    LOGD("  .eh_frame: %p (size %zu)", img->eh_frame, img->eh_frame_size);
+  }
+  
+  if (img->eh_frame_hdr && img->eh_frame_hdr_size > 0) {
+    LOGD("  .eh_frame_hdr: %p (size %zu)", img->eh_frame_hdr, img->eh_frame_hdr_size);
+  }
+}
+
+
 bool linker_link(struct linker *linker) {
   struct carray *loaded_libs = carray_create(64);
   if (!loaded_libs) {
@@ -1511,6 +1559,23 @@ bool linker_link(struct linker *linker) {
     _linker_restore_protections(dep->img);
   }
 
+  // Register main library
+  if (!register_custom_library_for_backtrace(linker->img))
+    LOGW("Failed to register main library for backtrace support");
+
+  register_eh_frame_for_library(linker->img);
+  // Register manually loaded dependencies
+  for (int i = 0; i < linker->dep_count; i++) {
+    struct loaded_dep *dep = &linker->dependencies[i];
+    if (dep->img && dep->is_manual_load) {
+        LOGD("Registering dependency %s for backtrace support", dep->img->elf);
+        if (!register_custom_library_for_backtrace(dep->img)) {
+            LOGW("Failed to register dependency %s for backtrace support", dep->img->elf);
+        }
+        register_eh_frame_for_library(dep->img);
+    }
+  }
+
   _linker_call_preinit_constructors(linker->img);
 
   /* INFO: Dependencies have their constructors called before the main elf. */
@@ -1525,6 +1590,12 @@ bool linker_link(struct linker *linker) {
   }
 
   _linker_call_constructors(linker->img);
+
+  verify_exception_tables(linker->img);
+  for (int i = 0; i < linker->dep_count; i++) {
+    if (linker->dependencies[i].img)
+      verify_exception_tables(linker->dependencies[i].img);
+  }
 
   linker->is_linked = true;
 

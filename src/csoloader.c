@@ -14,6 +14,7 @@
 #include "linker.h"
 #include "logging.h"
 
+/* INFO: Global variables for argument passing */
 extern int g_argc;
 extern char **g_argv;
 extern char **g_envp;

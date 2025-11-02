@@ -1,4 +1,5 @@
 /* INFO: Just a division for string array */
+
 #include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
