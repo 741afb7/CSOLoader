@@ -25,7 +25,7 @@ int64_t sleb128_decode(sleb128_decoder *decoder) {
 
   do {
     if (decoder->current >= decoder->end)
-      LOGF("sleb128 decode failed: out of bounds");
+      LOGF("Failed to decode SLEB128: buffer overrun");
 
     byte = *decoder->current++;
     value |= ((int64_t)(byte & 0x7F)) << shift;

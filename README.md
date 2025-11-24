@@ -1,6 +1,6 @@
 # CSOLoader
 
-CSOLoader is a traceless and system-linker-independent custom linker for Android Linux.
+CSOLoader is a traceless and system linker independent SOTA custom linker for Android Linux.
 
 ## Features
 
@@ -31,7 +31,7 @@ $ make
 
 ```shell
 $ cd shareds
-$ make
+$ make standalone
 ```
 
 ### 3. Run CSOLoader
@@ -58,7 +58,7 @@ It is mandatory to follow the PerformanC's [contribution guidelines](https://git
 
 ## Projects using CSOLoader
 
-None yet, soon [ReZygisk](https://github.com/PerformanC/ReZygisk).
+- [ReZygisk](https://github.com/PerformanC/ReZygisk)
 
 ## License
 

@@ -18,13 +18,14 @@
 #include "linker.h"
 #include "logging.h"
 
+/* INFO: System libunwind functions */
 void __register_frame(void *eh_frame) __attribute__((weak));
 void __deregister_frame(void *eh_frame) __attribute__((weak));
 
 #define MAX_CUSTOM_LIBS 64
 
 struct custom_lib_info {
-  ElfImg *img;
+  struct csoloader_elf *img;
   struct dl_phdr_info phdr_info;
   bool in_use;
   ElfW(Phdr) *phdr_copy;
@@ -76,38 +77,45 @@ static uint64_t read_uleb128(const uint8_t **p, const uint8_t *end) {
 #define DW_EH_PE_datarel  0x30
 #define DW_EH_PE_indirect 0x80
 
-static size_t ptr_size(void) {
-#ifdef __LP64__
-  return 8;
-#else
-  return 4;
-#endif
-}
-
 static int read_u16(const uint8_t **p, const uint8_t *end, uint16_t *out) {
-  if ((size_t)(end - *p) < 2) return -1;
-  uint16_t v;
-  memcpy(&v, *p, 2);
-  *p += 2;
+  if ((size_t)(end - *p) < sizeof(uint16_t)) {
+    return -1;
+  }
+
+  uint16_t v = 0;
+  memcpy(&v, *p, sizeof(uint16_t));
+
+  *p += sizeof(uint16_t);
   *out = v;
+
   return 0;
 }
 
 static int read_u32(const uint8_t **p, const uint8_t *end, uint32_t *out) {
-  if ((size_t)(end - *p) < 4) return -1;
-  uint32_t v;
-  memcpy(&v, *p, 4);
-  *p += 4;
+  if ((size_t)(end - *p) < sizeof(uint32_t)) {
+    return -1;
+  }
+
+  uint32_t v = 0;
+  memcpy(&v, *p, sizeof(uint32_t));
+
+  *p += sizeof(uint32_t);
   *out = v;
+
   return 0;
 }
 
 static int read_u64(const uint8_t **p, const uint8_t *end, uint64_t *out) {
-  if ((size_t)(end - *p) < 8) return -1;
-  uint64_t v;
-  memcpy(&v, *p, 8);
-  *p += 8;
+  if ((size_t)(end - *p) < sizeof(uint64_t)) {
+    return -1;
+  }
+
+  uint64_t v = 0;
+  memcpy(&v, *p, sizeof(uint64_t));
+
+  *p += sizeof(uint64_t);
   *out = v;
+
   return 0;
 }
 
@@ -179,7 +187,7 @@ static uintptr_t decode_eh_value(uint8_t enc, const uint8_t **p, uintptr_t base,
   return value;
 }
 
-static int locate_eh_frame_ptr(ElfImg *img, void **out_ptr, size_t *out_size) {
+static int locate_eh_frame_ptr(struct csoloader_elf *img, void **out_ptr, size_t *out_size) {
   *out_ptr = NULL;
   if (out_size) *out_size = 0;
 
@@ -250,7 +258,7 @@ static int locate_eh_frame_ptr(ElfImg *img, void **out_ptr, size_t *out_size) {
     }
   }
 
-  LOGW("Could not locate .eh_frame for %s", img->elf);
+  LOGW("Failed to locate .eh_frame for %s", img->elf);
 
   return -1;
 }
@@ -258,7 +266,22 @@ static int locate_eh_frame_ptr(ElfImg *img, void **out_ptr, size_t *out_size) {
 int custom_dl_iterate_phdr(int (*callback)(struct dl_phdr_info *, size_t, void *), void *data) {
   /* INFO: Must be resolved via dl_iterate_phdr to ensure we don't enter 
              a loop, see our "hook" for dladdr in the code below. */
-  int (*original_dl_iterate_phdr)(int (*callback)(struct dl_phdr_info *, size_t, void *), void *) = dlsym(RTLD_NEXT, "dl_iterate_phdr");
+  struct csoloader_elf *libdl_elf = csoloader_elf_create("libdl.so", NULL);
+  if (!libdl_elf) {
+    LOGE("Failed to open libdl.so via csoloader_elf");
+
+    return -1;
+  }
+
+  int (*original_dl_iterate_phdr)(int (*callback)(struct dl_phdr_info *, size_t, void *), void *) = (int (*)(int (*)(struct dl_phdr_info *, size_t, void *), void *))csoloader_elf_symb_address(libdl_elf, "dl_iterate_phdr");
+  if (!original_dl_iterate_phdr) {
+    LOGE("Failed to locate original dl_iterate_phdr in libdl.so");
+
+    csoloader_elf_destroy(libdl_elf);
+
+    return -1;
+  }
+  csoloader_elf_destroy(libdl_elf);
 
   int result = original_dl_iterate_phdr(callback, data);
   if (result != 0) return result;
@@ -279,14 +302,32 @@ int custom_dl_iterate_phdr(int (*callback)(struct dl_phdr_info *, size_t, void *
            "cannot" tamper the PLT of libc to redirect for our functions, we must
            declare them here, so that the system linker understands where we want
            it to call. */
-int dl_iterate_phdr(int (*callback)(struct dl_phdr_info *, size_t, void *), void *data) {
-  return custom_dl_iterate_phdr(callback, data);
-}
+/* INFO: Disable it, as it will cause infinite recursion. If one day we use it as
+           main linker, it won't even need to search in the system linker anyway. */
+// int dl_iterate_phdr(int (*callback)(struct dl_phdr_info *, size_t, void *), void *data) {
+//   return custom_dl_iterate_phdr(callback, data);
+// }
 
 int custom_dladdr(const void *addr, Dl_info *info) {
   /* INFO: Must be resolved via dladdr to ensure we don't enter a loop, see our
              "hook" for dladdr in the code below. */
-  int (*original_dladdr)(const void *, Dl_info *) = dlsym(RTLD_NEXT, "dladdr");
+  struct csoloader_elf *libdl_elf = csoloader_elf_create("libdl.so", NULL);
+  if (!libdl_elf) {
+    LOGE("Failed to open libdl.so via csoloader_elf");
+
+    return -1;
+  }
+
+  int (*original_dladdr)(const void *, Dl_info *) = (int (*)(const void *, Dl_info *))csoloader_elf_symb_address(libdl_elf, "dladdr");
+  if (!original_dladdr) {
+    LOGE("Failed to locate original dladdr in libdl.so");
+
+    csoloader_elf_destroy(libdl_elf);
+
+    return -1;
+  }
+
+  csoloader_elf_destroy(libdl_elf);
 
   if (original_dladdr(addr, info))
     return 1;
@@ -318,10 +359,10 @@ int custom_dladdr(const void *addr, Dl_info *info) {
     }
 
     if (have_segments) {
-      LOGD("custom_dladdr: custom lib %s segments cover %p - %p", g_custom_libs[i].phdr_info.dlpi_name, (void *)seg_min, (void *)seg_max);
-      LOGD("custom_dladdr: checking if address %p falls in any segment", addr);
+      LOGD("Custom lib %s segments cover %p - %p", g_custom_libs[i].phdr_info.dlpi_name, (void *)seg_min, (void *)seg_max);
+      LOGD("Checking if address %p falls in any segment", addr);
     } else {
-      LOGD("custom_dladdr: custom lib %s has no loadable segments", g_custom_libs[i].phdr_info.dlpi_name);
+      LOGD("Custom lib %s has no loadable segments", g_custom_libs[i].phdr_info.dlpi_name);
     }
 
     if (!in_range) continue;
@@ -329,7 +370,7 @@ int custom_dladdr(const void *addr, Dl_info *info) {
     info->dli_fname = g_custom_libs[i].phdr_info.dlpi_name;
     info->dli_fbase = (void *)g_custom_libs[i].phdr_info.dlpi_addr;
 
-    struct sym_info sym = elf_get_symbol(g_custom_libs[i].img, (uintptr_t)addr);
+    struct sym_info sym = csoloader_elf_get_symbol(g_custom_libs[i].img, (uintptr_t)addr);
     if (sym.name) {
       info->dli_sname = sym.name;
       info->dli_saddr = (void *)sym.address;
@@ -351,11 +392,13 @@ int custom_dladdr(const void *addr, Dl_info *info) {
            "cannot" tamper the PLT of libc to redirect for our functions, we must
            declare them here, so that the system linker understands where we want
            it to call. */
-int dladdr(const void *addr, Dl_info *info) {
-  return custom_dladdr(addr, info);
-}
+/* INFO: Disable it, as it will cause infinite recursion. If one day we use it as
+           main linker, it won't even need to search in the system linker anyway. */
+// int dladdr(const void *addr, Dl_info *info) {
+//   return custom_dladdr(addr, info);
+// }
 
-static ElfW(Phdr) *copy_program_headers(ElfImg *img) {
+static ElfW(Phdr) *copy_program_headers(struct csoloader_elf *img) {
   size_t phdr_size = img->header->e_phnum * sizeof(ElfW(Phdr));
   ElfW(Phdr) *phdr_copy = (ElfW(Phdr) *)malloc(phdr_size);
   if (!phdr_copy) {
@@ -370,7 +413,7 @@ static ElfW(Phdr) *copy_program_headers(ElfImg *img) {
   return phdr_copy;
 }
 
-bool register_custom_library_for_backtrace(ElfImg *img) {
+bool register_custom_library_for_backtrace(struct csoloader_elf *img) {
   pthread_mutex_lock(&g_custom_libs_mutex);
 
   int slot = -1;
@@ -422,12 +465,10 @@ bool register_custom_library_for_backtrace(ElfImg *img) {
 
   pthread_mutex_unlock(&g_custom_libs_mutex);
 
-  LOGD("Registered custom library %s for backtrace support", img->elf);
-
   return true;
 }
 
-bool unregister_custom_library_for_backtrace(ElfImg *img) {
+bool unregister_custom_library_for_backtrace(struct csoloader_elf *img) {
   pthread_mutex_lock(&g_custom_libs_mutex);
 
   for (int i = 0; i < MAX_CUSTOM_LIBS; i++) {
@@ -456,10 +497,10 @@ bool unregister_custom_library_for_backtrace(ElfImg *img) {
   return false;
 }
 
-void register_eh_frame_for_library(ElfImg *img) {
+void register_eh_frame_for_library(struct csoloader_elf *img) {
   #ifdef __arm__
-    (void)img;
-
+    (void)img; (void)locate_eh_frame_ptr;
+  
     LOGD("Skipping .eh_frame registration on ARM32 (EHABI)");
 
     return;
@@ -490,7 +531,7 @@ void register_eh_frame_for_library(ElfImg *img) {
   #endif
 }
 
-void unregister_eh_frame_for_library(ElfImg *img) {
+void unregister_eh_frame_for_library(struct csoloader_elf *img) {
   #ifdef __arm__
     (void)img;
   #else

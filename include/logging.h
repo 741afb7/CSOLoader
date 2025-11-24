@@ -9,16 +9,33 @@
 
 #include <stdio.h>
 
-#define LOGI(fmt, ...) fprintf(stdout, "INFO: " fmt "\n", ##__VA_ARGS__)
-#define LOGD(fmt, ...) fprintf(stdout, "DEBUG: " fmt "\n", ##__VA_ARGS__)
-#define LOGW(fmt, ...) fprintf(stderr, "WARNING: " fmt "\n", ##__VA_ARGS__)
-#define LOGE(fmt, ...) fprintf(stderr, "ERROR: " fmt "\n", ##__VA_ARGS__)
+#include <android/log.h>
 
-#define LOGF(fmt, ...) do {                             \
-    fprintf(stderr, "FATAL: " fmt "\n", ##__VA_ARGS__); \
-    exit(EXIT_FAILURE);                                 \
-} while (0)
+#define LOG_TAG "csoloader"
 
-#define PLOGE(fmt, ...) fprintf(stderr, "ERROR: " fmt ": %s\n", ##__VA_ARGS__, strerror(errno))
+#ifdef CSOLOADER_DEBUG
+  #ifdef __ANDROID__
+    #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+    #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+    #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
+    #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+    #define LOGF(...) do { __android_log_print(ANDROID_LOG_FATAL, LOG_TAG, __VA_ARGS__); abort(); } while(0)
+    #define PLOGE(fmt, ...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, fmt ": %s", ##__VA_ARGS__, strerror(errno))
+  #else
+    #define LOGD(...) fprintf(stderr, "[D] " LOG_TAG ": " __VA_ARGS__); fprintf(stderr, "\n")
+    #define LOGI(...) fprintf(stderr, "[I] " LOG_TAG ": " __VA_ARGS__); fprintf(stderr, "\n")
+    #define LOGW(...) fprintf(stderr, "[W] " LOG_TAG ": " __VA_ARGS__); fprintf(stderr, "\n")
+    #define LOGE(...) fprintf(stderr, "[E] " LOG_TAG ": " __VA_ARGS__); fprintf(stderr, "\n")
+    #define LOGF(...) do { fprintf(stderr, "[F] " LOG_TAG ": " __VA_ARGS__); fprintf(stderr, "\n"); abort(); } while(0)
+    #define PLOGE(fmt, ...) fprintf(stderr, "[E] " LOG_TAG ": " fmt ": %s\n", ##__VA_ARGS__, strerror(errno))
+  #endif
+#else
+  #define LOGD(...) do {} while(0)
+  #define LOGI(...) do {} while(0)
+  #define LOGW(...) do {} while(0)
+  #define LOGE(...) do {} while(0)
+  #define LOGF(...) do { abort(); } while(0)
+  #define PLOGE(fmt, ...) do {} while(0)
+#endif
 
 #endif /* LOGGING_H */

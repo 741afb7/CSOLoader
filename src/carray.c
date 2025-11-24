@@ -95,9 +95,31 @@ bool carray_add(struct carray *carr, const char *str) {
     }
   }
 
-  LOGW("Carray is full, cannot add string: %s", str);
+  LOGW("Carray is full, expanding size");
 
-  return false;
+  size_t new_size = carr->size * 2;
+  char **new_array = (char **)realloc(carr->array, new_size * sizeof(char *));
+  if (!new_array) {
+    LOGE("Failed to expand carray");
+
+    return false;
+  }
+
+  carr->array = new_array;
+  for (size_t i = carr->size; i < new_size; i++) {
+    carr->array[i] = NULL;
+  }
+  carr->size = new_size;
+
+  carr->array[carr->length] = strdup(str);
+  if (!carr->array[carr->length]) {
+    LOGE("Failed to duplicate string: %s", str);
+
+    return false;
+  }
+  carr->length++;
+
+  return true;
 }
 
 bool carray_remove(struct carray *carr, const char *str) {
@@ -111,6 +133,8 @@ bool carray_remove(struct carray *carr, const char *str) {
     if (carr->array[i] && strcmp(carr->array[i], str) == 0) {
       free(carr->array[i]);
       carr->array[i] = NULL;
+
+      memmove(&carr->array[i], &carr->array[i + 1], (carr->size - i - 1) * sizeof(char *));
 
       carr->length--;
 

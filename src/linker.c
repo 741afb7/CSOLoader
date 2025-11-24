@@ -6,20 +6,22 @@
 
 /* TODO: Make it more closely match ReZygisk's elf utils */
 
-#include <dlfcn.h>
-#include <errno.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
+#include <errno.h>
+#include <dlfcn.h>
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/auxv.h>
+#include <link.h>
+#include <limits.h>
+
 #include <sys/prctl.h>
 #include <unistd.h>
 #include <elf.h>
-#include <link.h>
-#include <limits.h>
 
 #include "carray.h"
 #include "elf_util.h"
@@ -98,7 +100,23 @@
   #endif
 #endif
 
-static size_t system_page_size = 0;
+#ifndef ALIGN_UP
+  #define ALIGN_UP(x, a)  ( ((x) + ((a) - 1)) & ~((a) - 1) )
+#endif
+
+#ifndef ALIGN_DOWN
+  #define ALIGN_DOWN(x, a)  ( (x) & ~((a) - 1) )
+#endif
+
+static size_t system_page_size;
+
+static inline uintptr_t _page_start(uintptr_t addr) {
+  return ALIGN_DOWN(addr, system_page_size);
+}
+
+static inline uintptr_t _page_end(uintptr_t addr) {
+  return ALIGN_DOWN(addr + system_page_size - 1, system_page_size);
+}
 
 /* INFO: Internal functions START */
 
@@ -106,7 +124,10 @@ int g_argc = 0;
 char **g_argv = NULL;
 char **g_envp = NULL;
 
-static void _linker_call_preinit_constructors(ElfImg *img) {
+#if 0
+/* INFO: preinit only is for the main EXECUTABLE. We don't deal with those, not for now, as
+             we are not a system linker that needs to start off everything. */
+static void _linker_call_preinit_constructors(struct csoloader_elf *img) {
   if (!img->preinit_array) return;
 
   LOGD("Calling .preinit_array constructors for %s", img->elf);
@@ -116,8 +137,9 @@ static void _linker_call_preinit_constructors(ElfImg *img) {
     img->preinit_array[i](g_argc, g_argv, g_envp);
   }
 }
+#endif
 
-static void _linker_call_constructors(ElfImg *img) {
+static void _linker_call_constructors(struct csoloader_elf *img) {
   if (img->init_func) {
     LOGD("Calling .init function for %s at %p", img->elf, img->init_func);
 
@@ -135,7 +157,7 @@ static void _linker_call_constructors(ElfImg *img) {
   }
 }
 
-static void _linker_call_destructors(ElfImg *img) {
+static void _linker_call_destructors(struct csoloader_elf *img) {
   if (img->fini_array) {
     LOGD("Calling .fini_array destructors for %s", img->elf);
 
@@ -156,22 +178,14 @@ static void _linker_call_destructors(ElfImg *img) {
 static void _linker_internal_init() {
   if (system_page_size != 0) return;
 
-  system_page_size = sysconf(_SC_PAGESIZE);
-  if (system_page_size <= 0) {
-    LOGE("Failed to get system page size");
+  /* INFO: If sysconf returns -1, will cause an integer underflow as the variable is to size_t.
+             To fix that, we first assign to a long variable, and only after checked, to size_t. */
+  long new_system_page_size = sysconf(_SC_PAGESIZE);
+  if (new_system_page_size <= 0) LOGF("Failed to get system page size");
 
-    return;
-  }
+  system_page_size = (size_t)new_system_page_size;
 
   LOGD("System page size: %zu bytes", system_page_size);
-}
-
-static inline uintptr_t _page_start(uintptr_t addr) {
-  return addr & ~(system_page_size - 1);
-}
-
-static inline uintptr_t _page_end(uintptr_t addr) {
-  return _page_start(addr + system_page_size - 1);
 }
 
 static bool _linker_find_library_path(const char *lib_name, char *full_path, size_t full_path_size) {
@@ -204,13 +218,19 @@ static bool _linker_find_library_path(const char *lib_name, char *full_path, siz
     NULL
   };
 
-  if (strcmp(lib_name, "libc++.so") == 0) {
-    LOGD("Forced replacement for using /system/lib64 for libc++.so");
+  #ifdef __ANDROID__
+    if (strcmp(lib_name, "libc++.so") == 0) {
+      LOGD("Forced replacement for using /system/lib64 for libc++.so");
 
-    snprintf(full_path, full_path_size, "/system/lib64/%s", lib_name);
+      #ifdef __LP64__
+        snprintf(full_path, full_path_size, "/system/lib64/%s", lib_name);
+      #else
+        snprintf(full_path, full_path_size, "/system/lib/%s", lib_name);
+      #endif
 
-    return true;
-  }
+      return true;
+    }
+  #endif
 
   for (int i = 0; search_paths[i] != NULL; ++i) {
     snprintf(full_path, full_path_size, "%s%s", search_paths[i], lib_name);
@@ -226,56 +246,65 @@ static bool _linker_find_library_path(const char *lib_name, char *full_path, siz
 
 /* INFO: Internal functions END */
 
-bool linker_init(struct linker *linker, ElfImg *img) {
+bool linker_init(struct linker *linker, struct csoloader_elf *img) {
   _linker_internal_init();
 
   linker->img = img;
   linker->is_linked = false;
+  linker->main_map_size = 0;
   linker->dep_count = 0;
 
-  for (int i = 0; i < MAX_DEPS; ++i) {
-    linker->dependencies[i].img = NULL;
-    linker->dependencies[i].is_manual_load = false;
-    linker->dependencies[i].file_vaddr_base = 0;
-  }
+  memset(linker->dependencies, 0, sizeof(linker->dependencies));
 
   return true;
 }
 
 void linker_destroy(struct linker *linker) {
-  if (linker->is_linked) {
-    LOGD("Unregistering libraries from backtrace support");
+  for (int i = linker->dep_count - 1; i >= 0; --i) {
+    struct loaded_dep *dep = &linker->dependencies[i];
+    if (!dep->img) continue;
 
-    for (int i = linker->dep_count - 1; i >= 0; --i) {
-      if (linker->dependencies[i].img && linker->dependencies[i].is_manual_load) {
-        unregister_eh_frame_for_library(linker->dependencies[i].img);
-        unregister_custom_library_for_backtrace(linker->dependencies[i].img);
-        _linker_call_destructors(linker->dependencies[i].img);
-      }
+    if (linker->is_linked && dep->is_manual_load) {
+      unregister_eh_frame_for_library(dep->img);
+      unregister_custom_library_for_backtrace(dep->img);
+      _linker_call_destructors(dep->img);
     }
 
+    void *dep_base = dep->map_base;
+    size_t dep_map_size = dep->map_size;
+
+    csoloader_elf_destroy(dep->img);
+    dep->img = NULL;
+    dep->map_base = NULL;
+    dep->map_size = 0;
+
+    if (dep->is_manual_load && dep_map_size > 0)
+      munmap(dep_base, dep_map_size);
+  }
+
+  if (linker->img && linker->is_linked) {
     unregister_eh_frame_for_library(linker->img);
     unregister_custom_library_for_backtrace(linker->img);
     _linker_call_destructors(linker->img);
   }
 
-  for (int i = 0; i < linker->dep_count; i++) {
-    if (!linker->dependencies[i].img) continue;
+  void *main_base = linker->img->base;
+  size_t main_map_size = linker->main_map_size;
 
-    void *base = linker->dependencies[i].img->base;
-    size_t size = linker->dependencies[i].img->size;
+  csoloader_elf_destroy(linker->img);
+  linker->img = NULL;
 
-    ElfImg_destroy(linker->dependencies[i].img);
-
-    if (linker->dependencies[i].is_manual_load) munmap(base, size);
-  }
+  if (main_base && main_map_size > 0)
+    munmap(main_base, main_map_size);
 
   linker->dep_count = 0;
+  linker->is_linked = false;
+  linker->main_map_size = 0;
 }
 
-static size_t phdr_get_load_size(const ElfW(Phdr) *phdr, size_t cnt, ElfW(Addr) *min_vaddr) {
+static size_t phdr_get_load_size(const ElfW(Phdr) *phdr, size_t length, ElfW(Addr) *min_vaddr) {
   ElfW(Addr) lo = UINTPTR_MAX, hi = 0;
-  for (size_t i = 0; i < cnt; ++i) {
+  for (size_t i = 0; i < length; ++i) {
     if (phdr[i].p_type != PT_LOAD) continue;
 
     if (phdr[i].p_vaddr < lo) lo = phdr[i].p_vaddr;
@@ -290,10 +319,10 @@ static size_t phdr_get_load_size(const ElfW(Phdr) *phdr, size_t cnt, ElfW(Addr) 
   return hi - lo;
 }
 
-static int _linker_load_one_segment(int fd, ElfW(Phdr)* phdr,
-                            ElfW(Addr) bias, off_t file_off) {
+static int _linker_load_one_segment(int fd, ElfW(Phdr) *phdr, ElfW(Addr) bias, off_t file_off) {
   ElfW(Addr) seg_start = phdr->p_vaddr + bias;
   ElfW(Addr) seg_end = seg_start + phdr->p_memsz;
+  ElfW(Addr) file_end = seg_start + phdr->p_filesz;
 
   ElfW(Addr) page_start = _page_start(seg_start);
   ElfW(Addr) page_end = _page_end(seg_end);
@@ -332,18 +361,18 @@ static int _linker_load_one_segment(int fd, ElfW(Phdr)* phdr,
 
       return -1;
     }
+
+    /* INFO: Clear the memory to avoid use of unitialized variables and garbage data. This is needed. */
+    memset(bss_addr, 0, bss_size);
   }
 
   /* INFO: This is needed to avoid access to uninitialized data */
-  if ((phdr->p_flags & PF_W) != 0) {
-    ElfW(Addr) file_end = seg_start + phdr->p_filesz;
-
-    /* INFO: Check if file_end is within the mapped range and it's not aligned
-               to the page boundary. */
-    if (file_end < page_end && (file_end % system_page_size) != 0) {
-      // Zero from the end of the file data to the next page boundary.
-      memset((void *)file_end, 0, system_page_size - (file_end % system_page_size));
-    }
+  if ((phdr->p_flags & PF_W) && file_end < (seg_start + phdr->p_memsz)) {
+    size_t zero_len = _page_end(file_end) - file_end;
+    size_t seg_tail = seg_start + phdr->p_memsz - file_end;
+    if (zero_len > seg_tail) zero_len = seg_tail;
+  
+    memset((void *)file_end, 0, zero_len);
   }
 
   /* INFO: Restore PROT_EXEC if it was removed earlier */
@@ -396,8 +425,8 @@ void *linker_load_library_manually(const char *lib_path, struct loaded_dep *out)
   }
 
   ElfW(Addr) min_vaddr;
-  size_t load_size = phdr_get_load_size(phdr, eh.e_phnum, &min_vaddr);
-  if (load_size == 0) {
+  out->map_size = phdr_get_load_size(phdr, eh.e_phnum, &min_vaddr);
+  if (out->map_size == 0) {
     LOGE("No loadable segments found in ELF headers");
 
     close(fd);
@@ -408,7 +437,7 @@ void *linker_load_library_manually(const char *lib_path, struct loaded_dep *out)
   }
 
   /* One PROT_NONE hole big enough for everything */
-  void *base = mmap(NULL, load_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  void *base = mmap(NULL, out->map_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (base == MAP_FAILED) {
     LOGE("Failed to reserve address space: %s", strerror(errno));
 
@@ -428,8 +457,7 @@ void *linker_load_library_manually(const char *lib_path, struct loaded_dep *out)
     if (_linker_load_one_segment(fd, &phdr[i], bias, 0) != 0) {
       LOGE("Failed to load segment %d of %s", i, lib_path);
 
-      munmap(base, load_size);
-
+      munmap(base, out->map_size);
       close(fd);
 
       free(phdr);
@@ -441,7 +469,7 @@ void *linker_load_library_manually(const char *lib_path, struct loaded_dep *out)
   close(fd);
 
   out->is_manual_load = true;
-  out->file_vaddr_base = _page_start(phdr[0].p_vaddr);
+  out->map_base = base;
   out->load_bias = bias;
 
   free(phdr);
@@ -451,14 +479,13 @@ void *linker_load_library_manually(const char *lib_path, struct loaded_dep *out)
 
 struct linker_symbol_info {
   void *addr;
-  ElfImg *img;
+  struct csoloader_elf *img;
 };
 
 static struct linker_symbol_info _linker_find_symbol_in_linker_scope(struct linker *linker, const char *sym_name) {
-  void *addr = (void *)getSymbAddress(linker->img, sym_name);
+  void *addr = (void *)csoloader_elf_symb_address(linker->img, sym_name);
   if (addr) {
-    LOGD("Found symbol '%s' in main image: %s via Elf Utils: %p",
-          sym_name, linker->img->elf, addr);
+    LOGD("Found symbol '%s' in main image: %s via Elf Utils: %p", sym_name, linker->img->elf, addr);
 
     return (struct linker_symbol_info) {
       .addr = addr,
@@ -467,11 +494,10 @@ static struct linker_symbol_info _linker_find_symbol_in_linker_scope(struct link
   }
 
   for (int i = 0; i < linker->dep_count; i++) {
-    addr = (void *)getSymbAddress(linker->dependencies[i].img, sym_name);
+    addr = (void *)csoloader_elf_symb_address(linker->dependencies[i].img, sym_name);
     if (!addr) continue;
 
-    LOGD("Found symbol '%s' in dependency %d: %s via Elf Utils: %p",
-         sym_name, i, linker->dependencies[i].img->elf, addr);
+    LOGD("Found symbol '%s' in dependency %d: %s via Elf Utils: %p", sym_name, i, linker->dependencies[i].img->elf, addr);
 
     return (struct linker_symbol_info) {
       .addr = addr,
@@ -563,7 +589,7 @@ static struct linker_symbol_info _linker_find_symbol_in_linker_scope(struct link
      - https://android.googlesource.com/platform/bionic/+/refs/tags/android-16.0.0_r1/linker/linker.cpp#2594
      - https://android.googlesource.com/platform/bionic/+/tags/android-16.0.0_r1/libc/bionic/bionic_call_ifunc_resolver.cpp#41
 */
-ElfW(Addr) handle_indirect_symbol(uintptr_t resolver_addr) {
+static ElfW(Addr) handle_indirect_symbol(uintptr_t resolver_addr) {
   #ifdef __aarch64__
     typedef ElfW(Addr) (*ifunc_resolver_t)(uint64_t, struct __ifunc_arg_t *);
 
@@ -596,17 +622,19 @@ struct tls_module {
   size_t memsz;
   size_t filesz;
   size_t offset;
+
   const void *init_image;
-  ElfImg  *owner;
+
+  struct csoloader_elf *owner;
 };
 
 static struct tls_module g_tls_modules[MAX_TLS_MODULES];
 /* INFO: "dlopen" counter for (future) TLS modules. */
-static size_t            g_tls_generation       = 0;
-static size_t            g_tls_static_size      = 0;
-static size_t            g_tls_static_align_max = 1;
+static size_t  g_tls_generation   = 0;
+static size_t  g_tls_static_size = 0;
+static size_t  g_tls_static_align_max = 1;
 
-static bool _linker_register_tls_segment(ElfImg *img) {
+static bool _linker_register_tls_segment(struct csoloader_elf *img) {
   if (!img->tls_segment) return true;
 
   size_t mod_id;
@@ -614,6 +642,7 @@ static bool _linker_register_tls_segment(ElfImg *img) {
     if (g_tls_modules[mod_id].module_id == 0) break;
   }
 
+  /* TODO: Allow limitless TLS modules by dynamically allocating more space */
   if (mod_id == MAX_TLS_MODULES) {
     LOGE("TLS module overflow");
 
@@ -628,13 +657,10 @@ static bool _linker_register_tls_segment(ElfImg *img) {
   m->init_image = (const void *)((uintptr_t)img->base + img->tls_segment->p_vaddr - img->bias);
   m->owner      = img;
 
-  #ifndef ALIGN_UP
-    #define ALIGN_UP(x, a)  ( ((x) + ((a) - 1)) & ~((a) - 1) )
-  #endif
+  g_tls_static_size = ALIGN_UP(g_tls_static_size, m->align);
+  m->offset         = g_tls_static_size;
+  g_tls_static_size += m->memsz;
 
-  g_tls_static_size      = ALIGN_UP(g_tls_static_size, m->align);
-  m->offset              = g_tls_static_size;
-  g_tls_static_size     += m->memsz;
   if (m->align > g_tls_static_align_max)
     g_tls_static_align_max = m->align;
 
@@ -650,16 +676,28 @@ static void _linker_alloc_tls_key_once(void) {
   pthread_key_create(&g_tls_key, free);
 }
 
-void *_linker_allocate_tls_for_thread(void) {
+static void *_linker_allocate_tls_for_thread(void) {
   pthread_once(&g_tls_key_once, _linker_alloc_tls_key_once);
 
-  uint8_t *block = calloc(1, g_tls_static_size + g_tls_static_align_max);
-  if (!block) return NULL;
+  size_t align = g_tls_static_align_max;
+  if (align == 0) align = sizeof(void *);
+  if (align > system_page_size) align = system_page_size;
 
-  for (size_t i = 1; i < MAX_TLS_MODULES; ++i) {
-    if (!g_tls_modules[i].module_id) continue;
+  size_t total_size = g_tls_static_size + align;
+  void *block_raw = NULL;
+  if (posix_memalign(&block_raw, align, total_size) != 0) {
+    LOGE("Failed to allocate aligned TLS block: size=%zu, align=%zu", total_size, align);
 
-    memcpy(block + g_tls_modules[i].offset, g_tls_modules[i].init_image, g_tls_modules[i].filesz);
+    return NULL;
+  }
+  memset(block_raw, 0, total_size);
+
+  char *block = (char *)block_raw;
+  for (int i = 1; i < MAX_TLS_MODULES; ++i) {
+    struct tls_module *m = &g_tls_modules[i];
+    if (!m->owner || !m->init_image || m->filesz == 0) continue;
+
+    memcpy(block + m->offset, m->init_image, m->filesz);
   }
 
   pthread_setspecific(g_tls_key, block);
@@ -667,20 +705,9 @@ void *_linker_allocate_tls_for_thread(void) {
   return block;
 }
 
-__attribute__((constructor)) static void _linker_setup_initial_tls(void) {
-  LOGD("Setting up initial TLS for main thread");
-
-  _linker_allocate_tls_for_thread();
-}
-
-__attribute__((destructor)) static void _linker_cleanup_initial_tls(void) {
-  LOGD("Cleaning up initial TLS for main thread");
-
-  free(pthread_getspecific(g_tls_key));
-  pthread_setspecific(g_tls_key, NULL);
-}
-
 static inline void *_linker_tls_block_for_current_thread(void) {
+  pthread_once(&g_tls_key_once, _linker_alloc_tls_key_once);
+
   void *p = pthread_getspecific(g_tls_key);
   if (!p) {
     LOGD("No TLS block found for current thread %llu, allocating new one", (unsigned long long)pthread_self());
@@ -698,6 +725,22 @@ struct tls_index {
   unsigned long offset;
 };
 
+static struct tls_index *allocate_tls_index_for_symbol(struct csoloader_elf *img, ElfW(Sym) *dynsym, uint32_t sym_idx, ElfW(Addr) addend) {
+  struct tls_index *ti = malloc(sizeof(*ti));
+  if (!ti) {
+    LOGE("Failed to allocate memory for tls_index");
+
+    return NULL;
+  }
+
+  ti->module = img->tls_mod_id;
+
+  ElfW(Sym) *sym = &dynsym[sym_idx];
+  ti->offset = sym->st_value + addend;
+
+  return ti;
+}
+
 void *__tls_get_addr(struct tls_index *ti) {
   void *block = _linker_tls_block_for_current_thread();
   if (!block) {
@@ -708,7 +751,7 @@ void *__tls_get_addr(struct tls_index *ti) {
 
   size_t mod_id = ti->module;
   if (mod_id == 0 || mod_id >= MAX_TLS_MODULES || g_tls_modules[mod_id].module_id == 0) {
-    LOGE("Library tried to access invalid TLS module ID %lu", mod_id);
+    LOGE("Library tried to access invalid TLS module ID %zu", mod_id);
 
     return NULL;
   }
@@ -723,7 +766,13 @@ struct _linker_unified_r {
   ElfW(Addr) r_addend;
 };
 
-static void _linker_process_unified_relocation(struct linker *linker, ElfImg *image, struct _linker_unified_r *r, ElfW(Addr) load_bias, ElfW(Sym) *dynsym, char *dynstr, bool is_rela) {
+static ElfW(Addr) dynamic_tls_resolver(struct tls_index *arg) {
+  void *addr = __tls_get_addr(arg);
+
+  return (ElfW(Addr))addr - (ElfW(Addr))_linker_tls_block_for_current_thread();
+}
+
+static void _linker_process_unified_relocation(struct linker *linker, struct csoloader_elf *image, struct _linker_unified_r *r, ElfW(Addr) load_bias, ElfW(Sym) *dynsym, char *dynstr, bool is_rela) {
   ElfW(Addr) *target_addr = (ElfW(Addr) *)(load_bias + r->r_offset);
 
   switch (r->type) {
@@ -733,23 +782,22 @@ static void _linker_process_unified_relocation(struct linker *linker, ElfImg *im
       break;
     }
     case R_GENERIC_COPY: {
-      LOGW("R_GENERIC_COPY relocation at %p in %s: This relocation type is not supported yet",
-           target_addr, image->elf);
+      LOGW("R_GENERIC_COPY relocation at %p in %s: This relocation type is not supported yet", target_addr, image->elf);
 
       break;
     }
     case R_GENERIC_IRELATIVE: {
       *target_addr = handle_indirect_symbol(load_bias + (is_rela ? r->r_addend : *(ElfW(Addr) *)(target_addr)));
 
-      LOGD("R_GENERIC_IRELATIVE relocation at %p in %s: Resolved to %p",
-           target_addr, image->elf, (void *)*target_addr);
+      LOGD("R_GENERIC_IRELATIVE relocation at %p in %s: Resolved to %p", target_addr, image->elf, (void *)*target_addr);
+
       break;
     }
     case R_GENERIC_RELATIVE: {
       *target_addr = load_bias + (is_rela ? r->r_addend : *(ElfW(Addr) *)(target_addr));
 
-      LOGD("R_GENERIC_RELATIVE relocation at %p in %s: Resolved to %p",
-           target_addr, image->elf, (void *)*target_addr);
+      LOGD("R_GENERIC_RELATIVE relocation at %p in %s: Resolved to %p", target_addr, image->elf, (void *)*target_addr);
+
       break;
     }
     case R_GENERIC_GLOB_DAT:
@@ -757,6 +805,7 @@ static void _linker_process_unified_relocation(struct linker *linker, ElfImg *im
     case R_GENERIC_JUMP_SLOT:
     case R_GENERIC_TLS_DTPMOD:
     case R_GENERIC_TLS_DTPREL:
+    case R_GENERIC_TLSDESC:
     case R_GENERIC_TLS_TPREL:
     #ifdef __x86_64__
       case R_X86_64_32:
@@ -805,32 +854,47 @@ static void _linker_process_unified_relocation(struct linker *linker, ElfImg *im
         }
         /* TODO: This TLS implementation is a SHIT and wrong */
         case R_GENERIC_TLS_DTPMOD: {
-          LOGF("Broken!");
-
           *target_addr = sym.img->tls_segment ? sym.img->tls_mod_id : 0;
 
-          LOGD("TLS: R_GENERIC_TLS_DTPMOD relocation at %p in %s: symbol '%s' resolved to module ID %p",
-               target_addr, image->elf, sym_name, (void *)*target_addr);
+          LOGD("TLS: R_GENERIC_TLS_DTPMOD relocation at %p in %s: symbol '%s' resolved to module ID %p", target_addr, image->elf, sym_name, (void *)*target_addr);
 
           break;
         }
         case R_GENERIC_TLS_DTPREL: {
-          LOGF("Broken!");
+          ElfW(Sym) *sym_ent = &dynsym[r->sym_idx];
+          *target_addr = sym_ent->st_value + r->r_addend;
 
-          *target_addr = r->r_addend;
 
-          LOGD("TLS: R_GENERIC_TLS_DTPREL relocation at %p in %s: symbol '%s' resolved to addend %p",
-               target_addr, image->elf, sym_name, (void *)*target_addr);
+          LOGD("TLS: R_GENERIC_TLS_DTPREL relocation at %p in %s: symbol '%s' resolved to addend %p", target_addr, image->elf, sym_name, (void *)*target_addr);
+
+          break;
+        }
+        case R_GENERIC_TLSDESC: {
+          struct tls_index *ti = allocate_tls_index_for_symbol(sym.img, dynsym, r->sym_idx, r->r_addend);
+          if (!ti) {
+              LOGE("Failed to allocate TlsIndex for TLSDESC symbol in %s", image->elf);
+              return;
+          }
+
+          ElfW(Addr) *desc = target_addr;
+          desc[0] = (ElfW(Addr))&dynamic_tls_resolver;
+          desc[1] = (ElfW(Addr))ti;
+
+          LOGD("TLS: R_GENERIC_TLSDESC relocation at %p in %s: symbol '%s' resolved to resolver %p with arg %p", target_addr, image->elf, sym_name, (void *)desc[0], (void *)desc[1]);
 
           break;
         }
         case R_GENERIC_TLS_TPREL: {
-          LOGF("Broken!");
+          ElfW(Sym) *sym_ent = &dynsym[r->sym_idx];
+          struct tls_index ti = {
+            .module = sym.img->tls_mod_id,
+            .offset = sym_ent->st_value + r->r_addend
+          };
 
-          *target_addr = (ElfW(Addr))sym.addr + r->r_addend - (ElfW(Addr))_linker_tls_block_for_current_thread();
+          void *var_addr = __tls_get_addr(&ti);
+          *target_addr = (ElfW(Addr))var_addr - (ElfW(Addr))_linker_tls_block_for_current_thread();
 
-          LOGD("TLS: R_GENERIC_TLS_TPREL relocation at %p in %s: symbol '%s' resolved to %p",
-               target_addr, image->elf, sym_name, (void *)*target_addr);
+          LOGD("TLS: R_GENERIC_TLS_TPREL relocation at %p in %s: symbol '%s' resolved to %p", target_addr, image->elf, sym_name, (void *)*target_addr);
 
           break;
         }
@@ -838,16 +902,14 @@ static void _linker_process_unified_relocation(struct linker *linker, ElfImg *im
         case R_X86_64_32: {
           *target_addr = (ElfW(Addr))sym.addr + r->r_addend;
 
-          LOGD("R_X86_64_32 relocation at %p in %s: symbol '%s' resolved to %p",
-               target_addr, image->elf, sym_name, (void *)*target_addr);
+          LOGD("R_X86_64_32 relocation at %p in %s: symbol '%s' resolved to %p", target_addr, image->elf, sym_name, (void *)*target_addr);
 
           break;
         }
         case R_X86_64_PC32: {
           *target_addr = (ElfW(Addr))sym.addr + r->r_addend - (ElfW(Addr))target_addr;
 
-          LOGD("R_X86_64_PC32 relocation at %p in %s: symbol '%s' resolved to %p",
-               target_addr, image->elf, sym_name, (void *)*target_addr);
+          LOGD("R_X86_64_PC32 relocation at %p in %s: symbol '%s' resolved to %p", target_addr, image->elf, sym_name, (void *)*target_addr);
 
           break;
         }
@@ -855,8 +917,7 @@ static void _linker_process_unified_relocation(struct linker *linker, ElfImg *im
         case R_386_PC32: {
           *target_addr = (ElfW(Addr))sym.addr + (is_rela ? *(ElfW(Addr) *)(target_addr) : r->r_addend) - (ElfW(Addr))target_addr;
 
-          LOGD("R_386_PC32 relocation at %p in %s: symbol '%s' resolved to %p",
-               target_addr, image->elf, sym_name, (void *)*target_addr);
+          LOGD("R_386_PC32 relocation at %p in %s: symbol '%s' resolved to %p", target_addr, image->elf, sym_name, (void *)*target_addr);
 
           break;
         }
@@ -872,7 +933,7 @@ static void _linker_process_unified_relocation(struct linker *linker, ElfImg *im
   }
 }
 
-static void _linker_process_relocations(struct linker *linker, ElfImg *image) {
+static void _linker_process_relocations(struct linker *linker, struct csoloader_elf *image) {
   ElfW(Phdr) *phdr = (ElfW(Phdr) *)((uintptr_t)image->header + image->header->e_phoff);
   ElfW(Dyn) *dyn = NULL;
   for (int i = 0; i < image->header->e_phnum; i++) {
@@ -945,6 +1006,17 @@ static void _linker_process_relocations(struct linker *linker, ElfImg *image) {
         case DT_ANDROID_RELASZ: android_reloc_sz = d->d_un.d_val; break;
         case DT_ANDROID_REL:    android_reloc = (void *)ptr_val; break;
         case DT_ANDROID_RELSZ:  android_reloc_sz = d->d_un.d_val; break;
+        case DT_ANDROID_RELR:   relr = (ElfW(Addr) *)ptr_val; break;
+        case DT_ANDROID_RELRSZ: relr_sz = d->d_un.d_val; break;
+        case DT_ANDROID_RELRENT: {
+          if (d->d_un.d_val != sizeof(ElfW(Addr))) {
+            LOGF("Unsupported DT_ANDROID_RELRENT size %zu in %s", (size_t)d->d_un.d_val, image->elf);
+
+            return;
+          }
+
+          break;
+        }
       #endif
     }
   }
@@ -958,43 +1030,42 @@ static void _linker_process_relocations(struct linker *linker, ElfImg *image) {
   if (relr) {
     LOGD("Processing RELR relocations for %s", image->elf);
 
+    const size_t word_size = sizeof(ElfW(Addr));
+    const size_t bits_per_entry = word_size * 8;
     ElfW(Addr) *relr_entries = relr;
-    size_t relr_count = relr_sz / sizeof(ElfW(Addr));
+    size_t relr_count = relr_sz / word_size;
     ElfW(Addr) load_bias = (ElfW(Addr))image->base - image->bias;
-    ElfW(Addr) base_offset = 0; 
+    ElfW(Addr) base_offset = 0;
 
     for (size_t i = 0; i < relr_count; i++) {
       ElfW(Addr) entry = relr_entries[i];
 
-      /* INFO: Even entries are addresses */
       if ((entry & 1) == 0) {
+        /* INFO: Even entries encode an explicit address */
         ElfW(Addr) reloc_offset = entry;
         ElfW(Addr) *target_addr = (ElfW(Addr) *)(load_bias + reloc_offset);
         *target_addr += load_bias;
 
-        base_offset = reloc_offset + sizeof(ElfW(Addr));
+        base_offset = reloc_offset + word_size;
+
         LOGD("RELR direct relocation at offset 0x%llx", (unsigned long long)reloc_offset);
 
         continue;
       }
 
-      /* INFO: Odd entries are bitmaps */
-      ElfW(Addr) current_offset = base_offset;
-      entry >>= 1; /* INFO: Skip the LSB which is 1 */
-      while (entry != 0) {
-        if ((entry & 1) != 0) {
-          ElfW(Addr) *target_addr = (ElfW(Addr) *)(load_bias + current_offset);
-          *target_addr += load_bias;
+      /* INFO: Odd entries encode a bitmap of up to (bits_per_entry - 1) following words */
+      ElfW(Addr) bitmap = entry >> 1;
 
-          LOGD("RELR bitmap relocation at offset 0x%llx", (unsigned long long)current_offset);
-        }
+      for (size_t bit = 0; bitmap != 0 && bit < bits_per_entry - 1; bit++, bitmap >>= 1) {
+        if ((bitmap & 1) == 0) continue;
 
-        current_offset += sizeof(ElfW(Addr));
-        entry >>= 1;
+        ElfW(Addr) *target_addr = (ElfW(Addr) *)(load_bias + base_offset + (bit * word_size));
+        *target_addr += load_bias;
+
+        LOGD("RELR bitmap relocation at offset 0x%llx", (unsigned long long)(base_offset + bit * word_size));
       }
 
-      /* INFO: After processing a bitmap, advance the base for the next one */
-      base_offset += (8 * sizeof(ElfW(Addr)) - 1) * sizeof(ElfW(Addr));
+      base_offset += word_size * (bits_per_entry - 1);
     }
   }
 
@@ -1053,8 +1124,6 @@ static void _linker_process_relocations(struct linker *linker, ElfImg *image) {
       sleb128_decoder_init(&decoder, packed_data, packed_size);
 
       uint64_t num_relocs = sleb128_decode(&decoder);
-
-      LOGD("Number of relocations: %llu", (unsigned long long)num_relocs);
 
       struct _linker_unified_r unified_r = {
         .r_offset = sleb128_decode(&decoder),
@@ -1177,56 +1246,7 @@ static bool _linker_is_library_loaded(struct linker *linker, const char *lib_pat
   return false;
 }
 
-static void _linker_zero_out_writable_segments(ElfImg *img) {
-  ElfW(Phdr) *phdr = (ElfW(Phdr) *)((uintptr_t)img->header + img->header->e_phoff);
-  uintptr_t dynamic_vaddr = 0;
-
-  for (int i = 0; i < img->header->e_phnum; i++) {
-    if (phdr[i].p_type != PT_DYNAMIC) continue;
-
-    dynamic_vaddr = phdr[i].p_vaddr;
-
-    LOGD("Located PT_DYNAMIC segment at virtual address: 0x%lx", dynamic_vaddr);
-
-    break;
-  }
-
-  if (dynamic_vaddr == 0) {
-    LOGE("Could not find PT_DYNAMIC segment in '%s'. Aborting cleanup to be safe.", img->elf);
-
-    return;
-  }
-
-  LOGD("Scanning for pure data segment to zero out in '%s'.", img->elf);
-  for (int i = 0; i < img->header->e_phnum; i++) {
-    if (phdr[i].p_type != PT_LOAD) continue;
-
-    /* INFO: Only zero out in writable, non-executable segments. */
-    if (!(phdr[i].p_flags & PF_W) || phdr[i].p_flags & PF_X) continue;
-
-    uintptr_t seg_start = phdr[i].p_vaddr;
-    uintptr_t seg_end = seg_start + phdr[i].p_memsz;
-
-    /* INFO: Check if dynamic metadata lives inside this segment, if so, skip. */
-    if (dynamic_vaddr >= seg_start && dynamic_vaddr < seg_end) {
-      LOGD("Skipping segment #%d (vaddr: 0x%lx) because it contains dynamic linking data.", i, seg_start);
-
-      continue;
-    }
-
-    void *segment_addr = (void *)((uintptr_t)img->base + phdr[i].p_vaddr - img->bias);
-    size_t segment_size = phdr[i].p_memsz;
-
-    if (segment_size > 0) {
-      LOGD("Found pure data segment #%d. Zeroing out.", i);
-      LOGD(" -> Address: %p, Size: %zu bytes.", segment_addr, segment_size);
-
-      memset(segment_addr, 0, segment_size);
-    }
-  }
-}
-
-static void _linker_restore_protections(ElfImg *image) {
+static void _linker_restore_protections(struct csoloader_elf *image) {
   ElfW(Phdr) *phdr = (ElfW(Phdr) *)((uintptr_t)image->header + image->header->e_phoff);
 
   /* INFO: Find the minimum and maximum addresses of all loadable segments. */
@@ -1304,31 +1324,6 @@ struct relro_region {
 struct relro_region relro_regions[MAX_RELRO];
 size_t relro_count = 0;
 
-static void verify_exception_tables(ElfImg *img) {
-  LOGD("Verifying exception tables for %s", img->elf);
-  
-  // Check if .gcc_except_table exists and is mapped
-  if (img->gcc_except_table && img->gcc_except_table_size > 0) {
-    LOGD("  .gcc_except_table: %p (size %zu)", img->gcc_except_table, img->gcc_except_table_size);
-    
-    // Try to read first byte to verify it's mapped
-    volatile uint8_t test = *(const uint8_t*)img->gcc_except_table;
-    (void)test;
-    LOGD("  .gcc_except_table is readable");
-  } else {
-    LOGW("  No .gcc_except_table found!");
-  }
-  
-  if (img->eh_frame && img->eh_frame_size > 0) {
-    LOGD("  .eh_frame: %p (size %zu)", img->eh_frame, img->eh_frame_size);
-  }
-  
-  if (img->eh_frame_hdr && img->eh_frame_hdr_size > 0) {
-    LOGD("  .eh_frame_hdr: %p (size %zu)", img->eh_frame_hdr, img->eh_frame_hdr_size);
-  }
-}
-
-
 bool linker_link(struct linker *linker) {
   struct carray *loaded_libs = carray_create(64);
   if (!loaded_libs) {
@@ -1374,7 +1369,7 @@ bool linker_link(struct linker *linker) {
     }
   }
 
-  for (int i = 0; i < carray_length(loaded_libs); i++) {
+  for (size_t i = 0; i < carray_length(loaded_libs); i++) {
     char *lib_name = carray_get(loaded_libs, i);
     if (!lib_name) {
       LOGE("Loaded library name is NULL");
@@ -1386,11 +1381,14 @@ bool linker_link(struct linker *linker) {
 
     char lib_full_path[PATH_MAX];
     if (!_linker_find_library_path(lib_name, lib_full_path, sizeof(lib_full_path))) {
-      LOGE("Could not find required library: %s", lib_name);
+      LOGW("Could not find required library: %s", lib_name);
 
-      carray_destroy(loaded_libs);
+      /* INFO: Rather than failing, just skip missing libraries.
+                 This allows loading libraries with optional dependencies. */
+      carray_remove(loaded_libs, lib_name);
+      i--;
 
-      return false;
+      continue;
     }
 
     if (_linker_is_library_loaded(linker, lib_full_path)) {
@@ -1399,31 +1397,39 @@ bool linker_link(struct linker *linker) {
       continue;
     }
 
-    LOGD("Loading library: %s", lib_full_path);
-
     struct loaded_dep *current_dep = &linker->dependencies[linker->dep_count];
+
     void *base_addr = NULL;
-    ElfImg *check_img = ElfImg_create(lib_full_path, NULL);
+    struct csoloader_elf *check_img = csoloader_elf_create(lib_full_path, NULL);
     if (check_img && check_img->base) {
       base_addr = check_img->base;
 
-      ElfImg_destroy(check_img);
-
-      current_dep->img = ElfImg_create(lib_full_path, base_addr);
+      current_dep->img = check_img;
       current_dep->is_manual_load = false;
     } else {
       base_addr = linker_load_library_manually(lib_full_path, current_dep);
       if (!base_addr) {
         LOGE("Failed to manually load library: %s", lib_full_path);
 
+        if (check_img) csoloader_elf_destroy(check_img);
         carray_destroy(loaded_libs);
 
         return false;
       }
 
-      current_dep->img = ElfImg_create(lib_full_path, base_addr);
+      current_dep->img = csoloader_elf_create(lib_full_path, base_addr);
+      if (!current_dep->img) {
+        LOGE("Failed to create ELF image for manually loaded library: %s", lib_full_path);
 
-      _linker_zero_out_writable_segments(current_dep->img);
+        if (check_img) csoloader_elf_destroy(check_img);
+        carray_destroy(loaded_libs);
+
+        return false;
+      }
+
+      current_dep->is_manual_load = true;
+
+      csoloader_elf_destroy(check_img);
     }
 
     if (!current_dep->img) {
@@ -1436,7 +1442,7 @@ bool linker_link(struct linker *linker) {
 
     linker->dep_count++;
 
-    if (current_dep->img->strtab_start) {
+    if (current_dep->is_manual_load && current_dep->img->header->e_phoff > 0 && current_dep->img->header->e_phnum > 0) {
       ElfW(Phdr) *dep_phdr = (ElfW(Phdr) *)((uintptr_t)current_dep->img->header + current_dep->img->header->e_phoff);
       ElfW(Dyn) *dep_dyn = NULL;
 
@@ -1489,11 +1495,6 @@ bool linker_link(struct linker *linker) {
   _linker_register_tls_segment(linker->img);
   for (int i = 0; i < linker->dep_count; i++) {
     struct loaded_dep *dep = &linker->dependencies[i];
-    if (!dep->is_manual_load) {
-      LOGD("Skipping TLS segment registration for pre-existing system library: %s", dep->img->elf);
-
-      continue;
-    }
 
     LOGD("Registering TLS segment for dependency: %s", dep->img->elf);
 
@@ -1509,7 +1510,7 @@ bool linker_link(struct linker *linker) {
     if (main_phdr[j].p_type != PT_LOAD || (main_phdr[j].p_flags & PF_W)) continue;
 
     void *page_start = (void *)(((uintptr_t)linker->img->base + main_phdr[j].p_vaddr - linker->img->bias) & ~(system_page_size - 1));
-    size_t page_len = (main_phdr[j].p_vaddr + main_phdr[j].p_memsz + system_page_size -1) & ~(system_page_size -1) - (main_phdr[j].p_vaddr & ~(system_page_size-1));
+    size_t page_len = _page_end(main_phdr[j].p_vaddr + main_phdr[j].p_memsz) - _page_start(main_phdr[j].p_vaddr);
 
     if (mprotect(page_start, page_len, PROT_READ | PROT_WRITE | (main_phdr[j].p_flags & PF_X ? PROT_EXEC : 0)) != 0)
       LOGW("mprotect failed to make main image segment %d writable: %s", j, strerror(errno));
@@ -1524,7 +1525,7 @@ bool linker_link(struct linker *linker) {
       if (dep_phdr[j].p_type != PT_LOAD || (dep_phdr[j].p_flags & PF_W)) continue;
 
       void *page_start = (void *)(((uintptr_t)dep->img->base + dep_phdr[j].p_vaddr - dep->img->bias) & ~(system_page_size - 1));
-      size_t page_len = (dep_phdr[j].p_vaddr + dep_phdr[j].p_memsz + system_page_size -1) & ~(system_page_size -1) - (dep_phdr[j].p_vaddr & ~(system_page_size-1));
+      size_t page_len = _page_end(dep_phdr[j].p_vaddr + dep_phdr[j].p_memsz) - _page_start(dep_phdr[j].p_vaddr);
 
       if (mprotect(page_start, page_len, PROT_READ | PROT_WRITE | (dep_phdr[j].p_flags & PF_X ? PROT_EXEC : 0)) != 0)
         LOGW("mprotect failed for make segment %d in %s writable: %s", j, dep->img->elf, strerror(errno));
@@ -1535,11 +1536,7 @@ bool linker_link(struct linker *linker) {
   _linker_process_relocations(linker, linker->img);
 
   for (int i = 0; i < linker->dep_count; i++) {
-    if (!linker->dependencies[i].is_manual_load) {
-      LOGD("Skipping relocations for pre-existing system library: %s", linker->dependencies[i].img->elf);
-
-      continue;
-    }
+    if (!linker->dependencies[i].is_manual_load) continue;
 
     LOGD("Processing relocations for manually loaded dependency: %s", linker->dependencies[i].img->elf);
     _linker_process_relocations(linker, linker->dependencies[i].img);
@@ -1565,43 +1562,35 @@ bool linker_link(struct linker *linker) {
     _linker_restore_protections(dep->img);
   }
 
-  // Register main library
   if (!register_custom_library_for_backtrace(linker->img))
     LOGW("Failed to register main library for backtrace support");
 
   register_eh_frame_for_library(linker->img);
-  // Register manually loaded dependencies
+
   for (int i = 0; i < linker->dep_count; i++) {
     struct loaded_dep *dep = &linker->dependencies[i];
-    if (dep->img && dep->is_manual_load) {
-        LOGD("Registering dependency %s for backtrace support", dep->img->elf);
-        if (!register_custom_library_for_backtrace(dep->img)) {
-            LOGW("Failed to register dependency %s for backtrace support", dep->img->elf);
-        }
-        register_eh_frame_for_library(dep->img);
+    if (!dep->is_manual_load) continue;
+
+    if (!register_custom_library_for_backtrace(dep->img)) {
+      LOGW("Failed to register dependency %s for backtrace support", dep->img->elf);
     }
+
+    register_eh_frame_for_library(dep->img);
   }
 
-  _linker_call_preinit_constructors(linker->img);
+  /* INFO: preinit only is for the main EXECUTABLE. We don't deal with those, not for now, as
+             we are not a system linker that needs to start off everything. */
+  // _linker_call_preinit_constructors(linker->img);
 
   /* INFO: Dependencies have their constructors called before the main elf. */
   for (int i = 0; i < linker->dep_count; i++) {
     struct loaded_dep *dep = &linker->dependencies[i];
-    if (dep->img && dep->is_manual_load) {
-      LOGD("Calling constructors for manually loaded dependency %s", dep->img->elf);
-      _linker_call_constructors(dep->img);
-    } else if (dep->img) {
-      LOGD("Skipping constructor call for pre-loaded dependency %s", dep->img->elf);
-    }
+    if (!dep->is_manual_load) continue;
+
+    _linker_call_constructors(dep->img);
   }
 
   _linker_call_constructors(linker->img);
-
-  verify_exception_tables(linker->img);
-  for (int i = 0; i < linker->dep_count; i++) {
-    if (linker->dependencies[i].img)
-      verify_exception_tables(linker->dependencies[i].img);
-  }
 
   linker->is_linked = true;
 

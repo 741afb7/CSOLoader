@@ -20,19 +20,17 @@
 #include "linker.h"
 #include "logging.h"
 
+#include "csoloader.h"
+
+/* TODO: Better separate the job of the linker and the loader */
+
 /* INFO: Global variables for argument passing */
 extern int g_argc;
 extern char **g_argv;
 extern char **g_envp;
 
-struct csoloader {
-  char *lib_path;
-  ElfImg *img;
-  struct linker linker;
-};
-
 bool csoloader_load(struct csoloader *lib, const char *lib_path) {
-  struct loaded_dep dep_info;
+  struct loaded_dep dep_info = { 0 };
   void *map_start = linker_load_library_manually(lib_path, &dep_info);
   if (!map_start) {
     LOGE("Failed to load library: %s", lib_path);
@@ -40,11 +38,12 @@ bool csoloader_load(struct csoloader *lib, const char *lib_path) {
     return false;
   }
 
-  ElfImg *elf_image = ElfImg_create(lib_path, (void *)dep_info.load_bias);
+  struct csoloader_elf *elf_image = csoloader_elf_create(lib_path, map_start);
   if (!elf_image) {
     LOGE("Failed to create ELF image for %s", lib_path);
 
-    munmap(map_start, elf_image->size);
+    if (dep_info.map_size > 0)
+      munmap(map_start, dep_info.map_size);
 
     return false;
   }
@@ -53,17 +52,21 @@ bool csoloader_load(struct csoloader *lib, const char *lib_path) {
   if (!linker_init(&linker, elf_image)) {
     LOGE("Failed to initialize linker for %s", lib_path);
 
-    munmap(map_start, elf_image->size);
-    ElfImg_destroy(elf_image);
+    csoloader_elf_destroy(elf_image);
+    if (dep_info.map_size > 0)
+      munmap(map_start, dep_info.map_size);
 
     return false;
   }
 
+  linker.main_map_size = dep_info.map_size;
+
   if (!linker_link(&linker)) {
     LOGE("Linker failed to link %s", lib_path);
 
-    munmap(map_start, elf_image->size);
-    ElfImg_destroy(elf_image);
+    csoloader_elf_destroy(elf_image);
+    if (dep_info.map_size > 0)
+      munmap(map_start, dep_info.map_size);
 
     return false;
   }
@@ -74,69 +77,72 @@ bool csoloader_load(struct csoloader *lib, const char *lib_path) {
     LOGE("Failed to duplicate library path string");
 
     linker_destroy(&linker);
-    ElfImg_destroy(elf_image);
-    munmap(map_start, elf_image->size);
+
+    csoloader_elf_destroy(elf_image);
+    if (dep_info.map_size > 0)
+      munmap(map_start, dep_info.map_size);
 
     return false;
   }
+
   lib->linker = linker;
 
   return true;
 }
 
 bool csoloader_unload(struct csoloader *lib) {
-  /* INFO: Linker needs to deinit constructors. Munmap later. */
   linker_destroy(&lib->linker);
-  munmap(lib->img->base, lib->img->size);
-  ElfImg_destroy(lib->img);
 
   free(lib->lib_path);
-  lib->lib_path = NULL;
+  
+  memset(lib, 0, sizeof(struct csoloader));
 
   return true;
 }
 
-int main(int argc, char *argv[], char *envp[]) {
-  LOGD("CSOLoader. Proprietary and confidential software. Copyright (c) 2025 by ThePedroo. All rights reserved.");
-
-  /* INFO: Constructors need these */
-  g_argc = argc;
-  g_argv = argv;
-  g_envp = envp;
-
-  if (argc < 2) {
-    LOGE("Usage: %s <library_path>", argv[0]);
-
-    return EXIT_FAILURE;
-  }
-
-  const char *lib_path = argv[1];
-
-  struct csoloader lib;
-  if (!csoloader_load(&lib, lib_path)) {
-    LOGE("Failed to load library: %s", lib_path);
-
-    return EXIT_FAILURE;
-  }
-
-  const char *symbol_name = "shared_function";
-  ElfW(Addr) sym_addr = getSymbAddress(lib.img, symbol_name);
-  if (sym_addr == 0) sym_addr = getSymbAddress(lib.img, "_Z15shared_functionv");
-
-  if (sym_addr == 0) {
-    LOGE("Symbol %s not found", symbol_name);
-  } else {
-    LOGD("Symbol %s found at final address %p", symbol_name, (void*)sym_addr);
-    void (*func)() = (void (*)())sym_addr;
-    func();
-    LOGD("Result of %s(): OK", symbol_name);
-  }
-
-  csoloader_unload(&lib);
-
-  LOGD("Successfully loaded and linked %s", lib_path);
-
-  /* TODO: Fix the bug where, in Linux, it will get permanently stuck here */
-
-  return EXIT_SUCCESS;
+void *csoloader_get_symbol(struct csoloader *lib, const char *symbol_name) {
+  return csoloader_elf_symb_address(lib->img, symbol_name);
 }
+
+#ifdef STANDALONE_TEST
+  int main(int argc, char **argv, char **envp) {
+    g_argc = argc;
+    g_argv = argv;
+    g_envp = envp;
+
+    if (argc < 2) {
+      printf("Usage: %s [file.so]\n", argv[0]);
+
+      return 1;
+    }
+
+    const char *lib_path = argv[1];
+
+    struct csoloader lib = { 0 };
+    if (!csoloader_load(&lib, lib_path)) {
+      printf("Failed to load library: %s\n", lib_path);
+
+      return 1;
+    }
+
+    printf("Successfully loaded library: %s\n", lib_path);
+
+    const char *symbol_name = "shared_function";
+    void *symbol_addr = csoloader_get_symbol(&lib, symbol_name);
+    if (symbol_addr) {
+      printf("Found symbol '%s' at address: %p\n", symbol_name, symbol_addr);
+    } else {
+      printf("Symbol '%s' not found in library.\n", symbol_name);
+    }
+
+    if (!csoloader_unload(&lib)) {
+      printf("Failed to unload library: %s\n", lib_path);
+
+      return 1;
+    }
+
+    printf("Successfully unloaded library: %s\n", lib_path);
+
+    return 0;
+  }
+#endif

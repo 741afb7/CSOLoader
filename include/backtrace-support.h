@@ -14,12 +14,12 @@ int custom_dl_iterate_phdr(int (*callback)(struct dl_phdr_info *, size_t, void *
 
 int custom_dladdr(const void *addr, Dl_info *info);
 
-bool register_custom_library_for_backtrace(ElfImg *img);
+bool register_custom_library_for_backtrace(struct csoloader_elf *img);
 
-bool unregister_custom_library_for_backtrace(ElfImg *img);
+bool unregister_custom_library_for_backtrace(struct csoloader_elf *img);
 
-void register_eh_frame_for_library(ElfImg *img);
+void register_eh_frame_for_library(struct csoloader_elf *img);
 
-void unregister_eh_frame_for_library(ElfImg *img);
+void unregister_eh_frame_for_library(struct csoloader_elf *img);
 
 #endif /* BACKTRACE_SUPPORT_H */

@@ -9,10 +9,12 @@
 #include <stdbool.h>
 #include <string.h>
 #include <fcntl.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/auxv.h>
+#include <errno.h>
 
+#include <dlfcn.h>
+#include <pthread.h>
 #include <unistd.h>
 
 #include "logging.h"
@@ -37,7 +39,7 @@
   #endif
 #endif
 
-uint32_t ElfHash(const char *name) {
+static uint32_t elf_hash(const char *name) {
   uint32_t h = 0, g = 0;
 
   while (*name) {
@@ -54,7 +56,7 @@ uint32_t ElfHash(const char *name) {
   return h;
 }
 
-uint32_t GnuHash(const char *name) {
+static uint32_t gnu_hash(const char *name) {
   uint32_t h = 5381;
 
   while (*name) {
@@ -64,32 +66,39 @@ uint32_t GnuHash(const char *name) {
   return h;
 }
 
-ElfW(Shdr) *offsetOf_Shdr(ElfW(Ehdr) *head, ElfW(Off) off) {
+static ElfW(Shdr) *offsetOf_Shdr(ElfW(Ehdr) *head, ElfW(Off) off) {
   return (ElfW(Shdr) *)(((uintptr_t)head) + off);
 }
 
-char *offsetOf_char(ElfW(Ehdr) *head, ElfW(Off) off) {
+static char *offsetOf_char(ElfW(Ehdr) *head, ElfW(Off) off) {
   return (char *)(((uintptr_t)head) + off);
 }
 
-ElfW(Sym) *offsetOf_Sym(ElfW(Ehdr) *head, ElfW(Off) off) {
+static ElfW(Sym) *offsetOf_Sym(ElfW(Ehdr) *head, ElfW(Off) off) {
   return (ElfW(Sym) *)(((uintptr_t)head) + off);
 }
 
-ElfW(Word) *offsetOf_Word(ElfW(Ehdr) *head, ElfW(Off) off) {
+static ElfW(Word) *offsetOf_Word(ElfW(Ehdr) *head, ElfW(Off) off) {
   return (ElfW(Word) *)(((uintptr_t)head) + off);
 }
 
-int dl_cb(struct dl_phdr_info *info, size_t size, void *data) {
+static int dl_cb(struct dl_phdr_info *info, size_t size, void *data) {
   (void) size;
 
   if (info->dlpi_name == NULL)
     return 0;
 
-  ElfImg *img = (ElfImg *)data;
-
+  struct csoloader_elf *img = (struct csoloader_elf *)data;
   if (strstr(info->dlpi_name, img->elf)) {
     img->base = (void *)info->dlpi_addr;
+
+    free(img->elf);
+    img->elf = strdup(info->dlpi_name);
+    if (!img->elf) {
+      LOGE("Failed to duplicate elf path string in dl_cb");
+
+      return 0;
+    }
 
     return 1;
   }
@@ -97,13 +106,13 @@ int dl_cb(struct dl_phdr_info *info, size_t size, void *data) {
   return 0;
 }
 
-bool _find_module_base(ElfImg *img) {
+static bool find_module_base(struct csoloader_elf *img) {
   dl_iterate_phdr(dl_cb, img);
 
   return img->base != NULL;
 }
 
-size_t calculate_valid_symtabs_amount(ElfImg *img) {
+static size_t calculate_valid_symtabs_amount(struct csoloader_elf *img) {
   size_t count = 0;
 
   if (img->symtab_start == NULL || img->symstr_offset_for_symtab == 0) {
@@ -128,7 +137,7 @@ size_t calculate_valid_symtabs_amount(ElfImg *img) {
   return count;
 }
 
-void ElfImg_destroy(ElfImg *img) {
+void csoloader_elf_destroy(struct csoloader_elf *img) {
   if (!img) return;
 
   if (img->symtabs_) {
@@ -149,17 +158,17 @@ void ElfImg_destroy(ElfImg *img) {
   }
 
   if (img->header) {
-    munmap(img->header, img->size);
+    free(img->header);
     img->header = NULL;
   }
 
   free(img);
 }
 
-ElfImg *ElfImg_create(const char *elf, void *base) {
-  ElfImg *img = (ElfImg *)calloc(1, sizeof(ElfImg));
+struct csoloader_elf *csoloader_elf_create(const char *elf, void *base) {
+  struct csoloader_elf *img = (struct csoloader_elf *)calloc(1, sizeof(struct csoloader_elf));
   if (!img) {
-    LOGE("Failed to allocate memory for ElfImg");
+    LOGE("Failed to allocate memory for struct csoloader_elf");
 
     return NULL;
   }
@@ -181,32 +190,32 @@ ElfImg *ElfImg_create(const char *elf, void *base) {
     */
     img->base = base;
 
-    LOGD("Using provided base address 0x%p for %s", base, elf);
+    LOGD("Using provided base address 0x%p for %s", base, img->elf);
   } else {
-    if (!_find_module_base(img)) {
-      LOGE("Failed to find module base for %s using dl_iterate_phdr", elf);
+    if (!find_module_base(img)) {
+      LOGE("Failed to find module base for %s using dl_iterate_phdr", img->elf);
 
-      ElfImg_destroy(img);
+      csoloader_elf_destroy(img);
 
       return NULL;
     }
   }
 
-  int fd = open(elf, O_RDONLY | O_CLOEXEC);
+  int fd = open(img->elf, O_RDONLY | O_CLOEXEC);
   if (fd < 0) {
-    LOGE("failed to open %s", elf);
+    LOGE("failed to open %s", img->elf);
 
-    ElfImg_destroy(img);
+    csoloader_elf_destroy(img);
 
     return NULL;
   }
 
   struct stat st;
   if (fstat(fd, &st) != 0) {
-    LOGE("fstat() failed for %s", elf);
+    LOGE("fstat() failed for %s", img->elf);
 
     close(fd);
-    ElfImg_destroy(img);
+    csoloader_elf_destroy(img);
 
     return NULL;
   }
@@ -214,43 +223,66 @@ ElfImg *ElfImg_create(const char *elf, void *base) {
   img->size = st.st_size;
 
   if (img->size <= sizeof(ElfW(Ehdr))) {
-    LOGE("Invalid file size %zu for %s", img->size, elf);
+    LOGE("Invalid file size %zu for %s", img->size, img->elf);
 
     close(fd);
-    ElfImg_destroy(img);
+    csoloader_elf_destroy(img);
 
     return NULL;
   }
 
-  img->header = (ElfW(Ehdr) *)mmap(NULL, img->size, PROT_READ, MAP_PRIVATE, fd, 0);
+  img->header = (ElfW(Ehdr) *)malloc(img->size);
+  if (!img->header) {
+    LOGE("Failed to allocate %zu bytes for %s", img->size, img->elf);
+
+    close(fd);
+    csoloader_elf_destroy(img);
+
+    return NULL;
+  }
+
+  size_t total_read = 0;
+  while (total_read < (size_t)img->size) {
+    ssize_t n = TEMP_FAILURE_RETRY(read(fd, (char *)img->header + total_read, img->size - total_read));
+    if (n < 0) {
+      LOGE("read() failed for %s: %s", img->elf, strerror(errno));
+
+      close(fd);
+      csoloader_elf_destroy(img);
+
+      return NULL;
+    }
+
+    if (n == 0) {
+      LOGE("Unexpected EOF while reading %s", img->elf);
+
+      close(fd);
+      csoloader_elf_destroy(img);
+
+      return NULL;
+    }
+
+    total_read += (size_t)n;
+  }
 
   close(fd);
 
-  if (img->header == MAP_FAILED) {
-    LOGE("mmap() failed for %s", elf);
-
-    img->header = NULL;
-    ElfImg_destroy(img);
-
-    return NULL;
-  }
-
   if (memcmp(img->header->e_ident, ELFMAG, SELFMAG) != 0) {
-    LOGE("Invalid ELF header for %s", elf);
+    LOGE("Invalid ELF header for %s", img->elf);
 
-    ElfImg_destroy(img);
+    csoloader_elf_destroy(img);
 
     return NULL;
   }
 
   if (img->header->e_shoff == 0 || img->header->e_shentsize == 0 || img->header->e_shnum == 0) {
-    LOGW("Section header table missing or invalid in %s", elf);
+    LOGW("Section header table missing or invalid in %s", img->elf);
   } else {
     img->section_header = offsetOf_Shdr(img->header, img->header->e_shoff);
   }
 
   if (img->header->e_phoff == 0 || img->header->e_phentsize == 0 || img->header->e_phnum == 0) {
-    LOGW("Program header table missing or invalid in %s", elf);
+    LOGW("Program header table missing or invalid in %s", img->elf);
   }
 
   ElfW(Shdr) *dynsym_shdr = NULL;
@@ -402,7 +434,7 @@ ElfImg *ElfImg_create(const char *elf, void *base) {
       img->symstr_offset_for_symtab = 0;
     }
   } else {
-    LOGD("No .symtab section found or section headers missing");
+    // LOGD("No .symtab section found or section headers missing");
 
     img->symtab_start = NULL;
     img->symtab_count = 0;
@@ -430,20 +462,20 @@ ElfImg *ElfImg_create(const char *elf, void *base) {
       if (phdr[i].p_type == PT_DYNAMIC) {
         dyn = (ElfW(Dyn) *)((uintptr_t)img->base + phdr[i].p_vaddr - img->bias);
 
-        LOGD("Located PT_DYNAMIC segment at virtual address: 0x%llu", (unsigned long long)phdr[i].p_vaddr);
+        // LOGD("Located PT_DYNAMIC segment at virtual address: 0x%llu", (unsigned long long)phdr[i].p_vaddr);
       }
 
       if (phdr[i].p_type == PT_TLS) {
         img->tls_segment = &phdr[i];
 
-        LOGD("Found TLS segment at %d in %s", i, elf);
+        // LOGD("Found TLS segment at %d in %s", i, img->elf);
       }
 
       if (phdr[i].p_type == PT_LOAD && phdr[i].p_offset == 0) {
         img->bias = phdr[i].p_vaddr - phdr[i].p_offset;
         bias_calculated = true;
 
-        LOGD("Calculated bias %ld from PT_LOAD segment %d (vaddr %lx)", (long)img->bias, i, (unsigned long)phdr[i].p_vaddr);
+        // LOGD("Calculated bias %ld from PT_LOAD segment %d (vaddr %lx)", (long)img->bias, i, (unsigned long)phdr[i].p_vaddr);
       }
     }
 
@@ -453,87 +485,59 @@ ElfImg *ElfImg_create(const char *elf, void *base) {
         case DT_INIT: {
           img->init_func = (linker_simple_func_t)ptr_val;
 
-          LOGD("Found DT_INIT for %s at %p", img->elf, img->init_func);
+          // LOGD("Found DT_INIT for %s at %p", img->elf, img->init_func);
 
           break;
         }
         case DT_FINI: {
           img->fini_func = (linker_simple_func_t)ptr_val;
 
-          LOGD("Found DT_FINI for %s at %p", img->elf, img->fini_func);
+          // LOGD("Found DT_FINI for %s at %p", img->elf, img->fini_func);
 
           break;
         }
         case DT_PREINIT_ARRAY: {
           img->preinit_array = (linker_ctor_function_t *)ptr_val;
 
-          LOGD("Found DT_PREINIT_ARRAY for %s at %p", img->elf, img->preinit_array);
+          // LOGD("Found DT_PREINIT_ARRAY for %s at %p", img->elf, img->preinit_array);
 
           break;
         }
         case DT_PREINIT_ARRAYSZ: {
           img->preinit_array_count = d->d_un.d_val / sizeof(ElfW(Addr));
 
-          LOGD("Found DT_PREINIT_ARRAYSZ for %s: %zu entries", img->elf, img->preinit_array_count);
+          // LOGD("Found DT_PREINIT_ARRAYSZ for %s: %zu entries", img->elf, img->preinit_array_count);
 
           break;
         }
         case DT_INIT_ARRAY: {
           img->init_array = (linker_ctor_function_t *)ptr_val;
 
-          LOGD("Found DT_INIT_ARRAY for %s at %p", img->elf, img->init_array);
+          // LOGD("Found DT_INIT_ARRAY for %s at %p", img->elf, img->init_array);
 
           break;
         }
         case DT_INIT_ARRAYSZ: {
           img->init_array_count = d->d_un.d_val / sizeof(ElfW(Addr));
 
-          LOGD("Found DT_INIT_ARRAYSZ for %s: %zu entries", img->elf, img->init_array_count);
+          // LOGD("Found DT_INIT_ARRAYSZ for %s: %zu entries", img->elf, img->init_array_count);
 
           break;
         }
         case DT_FINI_ARRAY: {
           img->fini_array = (linker_dtor_function_t *)ptr_val;
 
-          LOGD("Found DT_FINI_ARRAY for %s at %p", img->elf, img->fini_array);
+          // LOGD("Found DT_FINI_ARRAY for %s at %p", img->elf, img->fini_array);
 
           break;
         }
         case DT_FINI_ARRAYSZ: {
           img->fini_array_count = d->d_un.d_val / sizeof(linker_dtor_function_t);
 
-          LOGD("Found DT_FINI_ARRAYSZ for %s: %zu entries", img->elf, img->fini_array_count);
+          // LOGD("Found DT_FINI_ARRAYSZ for %s: %zu entries", img->elf, img->fini_array_count);
 
           break;
         }
-        case DT_RELR:
-        #ifdef __ANDROID__
-        case DT_ANDROID_RELR:
-        #endif
-          img->relr_ = (ElfW(Relr) *)(img->bias + d->d_un.d_ptr);
-
-          LOGD("Found DT_RELR/DT_ANDROID_RELR for %s at %p", img->elf, img->relr_);
-
-          break;
-        case DT_RELRSZ:
-        #ifdef __ANDROID__
-        case DT_ANDROID_RELRSZ:
-        #endif
-          img->relr_count_ = d->d_un.d_val / sizeof(ElfW(Relr));
-
-          LOGD("Found DT_RELRSZ/DT_ANDROID_RELRSZ for %s: %zu entries", img->elf, img->relr_count_);
-
-          break;
-        case DT_RELRENT:
-        #ifdef __ANDROID__
-        case DT_ANDROID_RELRENT:
-        #endif
-          LOGD("Found DT_RELRENT/DT_ANDROID_RELRENT for %s", img->elf);
-
-          if (d->d_un.d_val != sizeof(ElfW(Relr)))
-            LOGF("invalid DT_RELRENT: %zd", (size_t)d->d_un.d_val);
-
-          break;
       }
     }
 
@@ -543,8 +547,8 @@ ElfImg *ElfImg_create(const char *elf, void *base) {
       img->bias = phdr[i].p_vaddr - phdr[i].p_offset;
       bias_calculated = true;
 
-      LOGD("Calculated bias %ld from first PT_LOAD segment %d (vaddr %lx, offset %lx)",
-          (long)img->bias, i, (unsigned long)phdr[i].p_vaddr, (unsigned long)phdr[i].p_offset);
+      // LOGD("Calculated bias %ld from first PT_LOAD segment %d (vaddr %lx, offset %lx)",
+      //     (long)img->bias, i, (unsigned long)phdr[i].p_vaddr, (unsigned long)phdr[i].p_offset);
 
       break;
     }
@@ -555,7 +559,7 @@ ElfImg *ElfImg_create(const char *elf, void *base) {
         img->eh_frame_hdr = (const uint8_t *)((uintptr_t)img->base + phdr[i].p_vaddr - img->bias);
         img->eh_frame_hdr_size = phdr[i].p_memsz;
 
-        LOGD("Found PT_GNU_EH_FRAME for %s at %p (size %zu)", img->elf, img->eh_frame_hdr, img->eh_frame_hdr_size);
+        // LOGD("Found PT_GNU_EH_FRAME for %s at %p (size %zu)", img->elf, img->eh_frame_hdr, img->eh_frame_hdr_size);
       }
 
       #ifdef __arm__
@@ -563,22 +567,22 @@ ElfImg *ElfImg_create(const char *elf, void *base) {
           img->arm_exidx = (const uint8_t *)((uintptr_t)img->base + phdr[i].p_vaddr - img->bias);
           img->arm_exidx_count = phdr[i].p_memsz / 8;
 
-          LOGD("Found PT_ARM_EXIDX for %s at %p (entries %zu)", img->elf, img->arm_exidx, img->arm_exidx_count);
+          // LOGD("Found PT_ARM_EXIDX for %s at %p (entries %zu)", img->elf, img->arm_exidx, img->arm_exidx_count);
         }
       #endif
     }
   }
 
   if (!bias_calculated)
-    LOGE("Failed to calculate bias for %s. Assuming bias is 0.", elf);
+    LOGE("Failed to calculate bias for %s. Assuming bias is 0.", img->elf);
 
   if (!img->dynsym_start || !img->strtab_start) {
-    if (img->header->e_type == ET_DYN) LOGE("Failed to find .dynsym or its string table (.dynstr) in %s", elf);
-    else LOGW("No .dynsym or .dynstr found in %s (might be expected for ET_EXEC)", elf);
+    if (img->header->e_type == ET_DYN) LOGE("Failed to find .dynsym or its string table (.dynstr) in %s", img->elf);
+    else LOGW("No .dynsym or .dynstr found in %s (might be expected for ET_EXEC)", img->elf);
   }
 
   if (!img->gnu_bucket_ && !img->bucket_)
-    LOGW("No hash table (.gnu.hash or .hash) found in %s. Dynamic symbol lookup might be slow or fail.", elf);
+    LOGW("No hash table (.gnu.hash or .hash) found in %s. Dynamic symbol lookup might be slow or fail.", img->elf);
 
   /* INFO: Populate EH regions from Section Headers */
   if (img->section_header && img->header->e_shstrndx != SHN_UNDEF && img->header->e_shstrndx < img->header->e_shnum) {
@@ -620,7 +624,7 @@ ElfImg *ElfImg_create(const char *elf, void *base) {
   return img;
 }
 
-bool _load_symtabs(ElfImg *img) {
+static bool load_symtabs(struct csoloader_elf *img) {
   if (img->symtabs_) return true;
 
   if (!img->symtab_start || img->symstr_offset_for_symtab == 0 || img->symtab_count == 0) {
@@ -686,7 +690,7 @@ bool _load_symtabs(ElfImg *img) {
   return true;
 }
 
-ElfW(Addr) GnuLookup(ElfImg *restrict img, const char *name, uint32_t hash, unsigned char *sym_type) {
+static ElfW(Addr) gnu_symbol_lookup(struct csoloader_elf *restrict img, const char *name, uint32_t hash, unsigned char *sym_type) {
   if (img->gnu_nbucket_ == 0 || img->gnu_bloom_size_ == 0 || !img->gnu_bloom_filter_ || !img->gnu_bucket_ || !img->gnu_chain_ || !img->dynsym_start || !img->strtab_start)
     return 0;
 
@@ -767,7 +771,7 @@ ElfW(Addr) GnuLookup(ElfImg *restrict img, const char *name, uint32_t hash, unsi
   return 0;
 }
 
-ElfW(Addr) ElfLookup(ElfImg *restrict img, const char *restrict name, uint32_t hash, unsigned char *sym_type) {
+static ElfW(Addr) elf_symbol_lookup(struct csoloader_elf *restrict img, const char *restrict name, uint32_t hash, unsigned char *sym_type) {
   if (img->nbucket_ == 0 || !img->bucket_ || !img->chain_ || !img->dynsym_start || !img->strtab_start)
     return 0;
 
@@ -787,10 +791,8 @@ ElfW(Addr) ElfLookup(ElfImg *restrict img, const char *restrict name, uint32_t h
   return 0;
 }
 
-bool _load_symtabs(ElfImg *img);
-
-ElfW(Addr) LinearLookup(ElfImg *img, const char *restrict name, unsigned char *sym_type) {
-  if (!_load_symtabs(img)) {
+static ElfW(Addr) linear_symbol_lookup(struct csoloader_elf *img, const char *restrict name, unsigned char *sym_type) {
+  if (!load_symtabs(img)) {
     // LOGE("Failed to load symtabs for linear lookup of %s", name);
 
     return 0;
@@ -819,8 +821,8 @@ ElfW(Addr) LinearLookup(ElfImg *img, const char *restrict name, unsigned char *s
   return 0;
 }
 
-ElfW(Addr) LinearLookupByPrefix(ElfImg *img, const char *prefix, unsigned char *sym_type) {
-  if (!_load_symtabs(img)) {
+static ElfW(Addr) linear_symbol_lookupByPrefix(struct csoloader_elf *img, const char *prefix, unsigned char *sym_type) {
+  if (!load_symtabs(img)) {
     LOGE("Failed to load symtabs for linear lookup by prefix of %s", prefix);
 
     return 0;
@@ -855,16 +857,16 @@ ElfW(Addr) LinearLookupByPrefix(ElfImg *img, const char *prefix, unsigned char *
   return 0;
 }
 
-ElfW(Addr) getSymbOffset(ElfImg *img, const char *name, unsigned char *sym_type) {
+ElfW(Addr) csoloader_elf_symb_offset(struct csoloader_elf *img, const char *name, unsigned char *sym_type) {
   ElfW(Addr) offset = 0;
 
-  offset = GnuLookup(img, name, GnuHash(name), sym_type);
+  offset = gnu_symbol_lookup(img, name, gnu_hash(name), sym_type);
   if (offset != 0) return offset;
 
-  offset = ElfLookup(img, name, ElfHash(name), sym_type);
+  offset = elf_symbol_lookup(img, name, elf_hash(name), sym_type);
   if (offset != 0) return offset;
 
-  offset = LinearLookup(img, name, sym_type);
+  offset = linear_symbol_lookup(img, name, sym_type);
   if (offset != 0) return offset;
 
   return 0;
@@ -882,7 +884,7 @@ ElfW(Addr) getSymbOffset(ElfImg *img, const char *name, unsigned char *sym_type)
     int64_t key;
     uint64_t value;
   };
-  int __riscv_hwprobe(struct riscv_hwprobe *pairs, size_t pair_count, size_t cpu_count, unsigned long *cpus, unsigned flags) {
+  static int __riscv_hwprobe(struct riscv_hwprobe *pairs, size_t pair_count, size_t cpu_count, unsigned long *cpus, unsigned flags) {
     register long a0 __asm__("a0") = (long)pairs;
     register long a1 __asm__("a1") = pair_count;
     register long a2 __asm__("a2") = cpu_count;
@@ -901,7 +903,7 @@ ElfW(Addr) getSymbOffset(ElfImg *img, const char *name, unsigned char *sym_type)
   typedef int (*__riscv_hwprobe_t)(struct riscv_hwprobe *__pairs, size_t __pair_count, size_t __cpu_count, unsigned long *__cpus, unsigned __flags);
 #endif
 
-static ElfW(Addr) handle_indirect_symbol(ElfImg *img, ElfW(Off) offset) {
+static ElfW(Addr) handle_indirect_symbol(struct csoloader_elf *img, ElfW(Off) offset) {
   ElfW(Addr) resolver_addr = (ElfW(Addr))((uintptr_t)img->base + offset - img->bias);
 
   #ifdef __aarch64__
@@ -929,9 +931,9 @@ static ElfW(Addr) handle_indirect_symbol(ElfImg *img, ElfW(Off) offset) {
   #endif
 }
 
-ElfW(Addr) getSymbAddress(ElfImg *img, const char *name) {
+ElfW(Addr) csoloader_elf_symb_address(struct csoloader_elf *img, const char *name) {
   unsigned char sym_type = 0;
-  ElfW(Addr) offset = getSymbOffset(img, name, &sym_type);
+  ElfW(Addr) offset = csoloader_elf_symb_offset(img, name, &sym_type);
 
   if (offset == 0 || !img->base) return 0;
 
@@ -944,9 +946,9 @@ ElfW(Addr) getSymbAddress(ElfImg *img, const char *name) {
   return (ElfW(Addr))((uintptr_t)img->base + offset - img->bias);
 }
 
-ElfW(Addr) getSymbAddressByPrefix(ElfImg *img, const char *prefix) {
+ElfW(Addr) csoloader_elf_symb_address_by_prefix(struct csoloader_elf *img, const char *prefix) {
   unsigned char sym_type = 0;
-  ElfW(Addr) offset = LinearLookupByPrefix(img, prefix, &sym_type);
+  ElfW(Addr) offset = linear_symbol_lookupByPrefix(img, prefix, &sym_type);
 
   if (offset == 0 || !img->base) return 0;
 
@@ -959,36 +961,45 @@ ElfW(Addr) getSymbAddressByPrefix(ElfImg *img, const char *prefix) {
   return (ElfW(Addr))((uintptr_t)img->base + offset - img->bias);
 }
 
-void *getSymbValueByPrefix(ElfImg *img, const char *prefix) {
-  ElfW(Addr) address = getSymbAddressByPrefix(img, prefix);
+void *csoloader_elf_symb_value_by_prefix(struct csoloader_elf *img, const char *prefix) {
+  ElfW(Addr) address = csoloader_elf_symb_address_by_prefix(img, prefix);
 
   return address == 0 ? NULL : *((void **)address);
 }
 
-struct sym_info elf_get_symbol(ElfImg *img, uintptr_t addr) {
-  if (!_load_symtabs(img)) {
-    return (struct sym_info){ .name = NULL, .address = 0 };
+struct sym_info csoloader_elf_get_symbol(struct csoloader_elf *img, uintptr_t addr) {
+  if (!load_symtabs(img)) {
+    return (struct sym_info) {
+      .name = NULL,
+      .address = 0
+    };
   }
 
   size_t valid_symtabs_amount = calculate_valid_symtabs_amount(img);
   if (valid_symtabs_amount == 0) {
-    return (struct sym_info){ .name = NULL, .address = 0 };
+    return (struct sym_info) {
+      .name = NULL,
+      .address = 0
+    };
   }
 
   for (size_t i = 0; i < valid_symtabs_amount; i++) {
     ElfW(Sym) *sym = img->symtabs_[i].sym;
-
-    if (sym->st_value == 0 || sym->st_size == 0) {
-      continue;
-    }
+    if (sym->st_value == 0 || sym->st_size == 0) continue;
 
     ElfW(Addr) sym_start = (ElfW(Addr))((uintptr_t)img->base + sym->st_value - img->bias);
     ElfW(Addr) sym_end = sym_start + sym->st_size;
 
     if (addr >= sym_start && addr < sym_end) {
-      return (struct sym_info){ .name = img->symtabs_[i].name, .address = sym_start };
+      return (struct sym_info) {
+        .name = img->symtabs_[i].name,
+        .address = sym_start
+      };
     }
   }
 
-  return (struct sym_info){ .name = NULL, .address = 0 };
+  return (struct sym_info) {
+    .name = NULL,
+    .address = 0
+  };
 }

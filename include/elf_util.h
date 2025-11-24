@@ -25,8 +25,7 @@ struct symtabs {
   ElfW(Sym) *sym;
 };
 
-/* TODO: Use pure struct. This looks horrible. */
-typedef struct {
+struct csoloader_elf {
   char *elf;
   void *base;
   ElfW(Ehdr) *header;
@@ -63,9 +62,6 @@ typedef struct {
   ElfW(Phdr) *tls_segment;
   size_t tls_mod_id;
 
-  ElfW(Relr) *relr_;
-  size_t relr_count_;
-
   struct symtabs *symtabs_;
 
   linker_ctor_function_t *preinit_array;
@@ -92,27 +88,25 @@ typedef struct {
     const uint8_t *arm_exidx;
     size_t arm_exidx_count;
   #endif
-} ElfImg;
+};
 
 struct sym_info {
   const char *name;
   ElfW(Addr) address;
 };
 
-void ElfImg_destroy(ElfImg *img);
+void csoloader_elf_destroy(struct csoloader_elf *img);
 
-void *get_library_base(const char *lib_path);
+struct csoloader_elf *csoloader_elf_create(const char *elf, void *base);
 
-ElfImg *ElfImg_create(const char *elf, void *base);
+ElfW(Addr) csoloader_elf_symb_offset(struct csoloader_elf *img, const char *name, unsigned char *sym_type);
 
-ElfW(Addr) getSymbOffset(ElfImg *img, const char *name, unsigned char *sym_type);
+ElfW(Addr) csoloader_elf_symb_address(struct csoloader_elf *img, const char *name);
 
-ElfW(Addr) getSymbAddress(ElfImg *img, const char *name);
+ElfW(Addr) csoloader_elf_symb_address_by_prefix(struct csoloader_elf *img, const char *prefix);
 
-ElfW(Addr) getSymbAddressByPrefix(ElfImg *img, const char *prefix);
+void *csoloader_elf_symb_value_by_prefix(struct csoloader_elf *img, const char *prefix);
 
-void *getSymbValueByPrefix(ElfImg *img, const char *prefix);
-
-struct sym_info elf_get_symbol(ElfImg *img, uintptr_t addr);
+struct sym_info csoloader_elf_get_symbol(struct csoloader_elf *img, uintptr_t addr);
 
 #endif /* ELF_UTIL_H */

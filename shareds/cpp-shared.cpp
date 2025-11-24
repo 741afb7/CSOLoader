@@ -19,6 +19,7 @@
 #include <stdexcept>
 
 /* TODO: Implement dependency dependency test */
+/* TODO: Implement TLS test */
 
 extern "C" {
   void test_relocation() {

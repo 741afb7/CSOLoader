@@ -1,0 +1,27 @@
+#ifndef CSOLOADER_H
+#define CSOLOADER_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include "elf_util.h"
+#include "linker.h"
+
+struct csoloader {
+  char *lib_path;
+  struct csoloader_elf *img;
+  struct linker linker;
+};
+
+bool csoloader_load(struct csoloader *lib, const char *lib_path);
+
+bool csoloader_unload(struct csoloader *lib);
+
+void *csoloader_get_symbol(struct csoloader *lib, const char *symbol_name);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* CSOLOADER_H */
