@@ -139,12 +139,14 @@ void *csoloader_get_symbol(struct csoloader *lib, const char *symbol_name) {
     printf("Successfully loaded library: %s\n", lib_path);
 
     const char *symbol_name = "shared_function";
-    void *symbol_addr = csoloader_get_symbol(&lib, symbol_name);
+    void (*symbol_addr)(void) = csoloader_get_symbol(&lib, symbol_name);
     if (symbol_addr) {
       printf("Found symbol '%s' at address: %p\n", symbol_name, symbol_addr);
     } else {
       printf("Symbol '%s' not found in library.\n", symbol_name);
     }
+
+    symbol_addr();
 
     if (!csoloader_unload(&lib)) {
       printf("Failed to unload library: %s\n", lib_path);
