@@ -897,6 +897,7 @@ static void _linker_process_unified_relocation(struct linker *linker, struct cso
           break;
         }
         case R_GENERIC_TLSDESC: {
+          /* INFO: ti is not owned by this function. It will be freed outside. */
           struct tls_index *ti = allocate_tls_index_for_symbol(sym.img, dynsym, r->sym_idx, r->r_addend);
           if (!ti) {
               LOGE("Failed to allocate TlsIndex for TLSDESC symbol in %s", image->elf);
