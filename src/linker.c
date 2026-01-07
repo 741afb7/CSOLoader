@@ -1272,11 +1272,11 @@ static void _linker_process_relocations(struct linker *linker, struct csoloader_
   }
 }
 
-static bool _linker_is_library_loaded(struct linker *linker, const char *lib_path) {
-  if (strcmp(linker->img->elf, lib_path) == 0) return true;
+static bool _linker_is_library_loaded(struct linker *linker, const char *lib_name) {
+  if (strstr(linker->img->elf, lib_name)) return true;
 
   for (int i = 0; i < linker->dep_count; i++) {
-    if (strcmp(linker->dependencies[i].img->elf, lib_path) == 0) return true;
+    if (strstr(linker->dependencies[i].img->elf, lib_name)) return true;
   }
 
   return false;
@@ -1436,7 +1436,7 @@ bool linker_link(struct linker *linker) {
     struct loaded_dep *current_dep = &linker->dependencies[linker->dep_count];
 
     void *base_addr = NULL;
-    struct csoloader_elf *check_img = csoloader_elf_create(lib_full_path, NULL);
+    struct csoloader_elf *check_img = csoloader_elf_create(lib_name, NULL);
     if (check_img && check_img->base) {
       base_addr = check_img->base;
 
