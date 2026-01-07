@@ -473,7 +473,7 @@ bool unregister_custom_library_for_backtrace(struct csoloader_elf *img) {
   pthread_mutex_lock(&g_custom_libs_mutex);
 
   for (int i = 0; i < MAX_CUSTOM_LIBS; i++) {
-    if (g_custom_libs[i].in_use && g_custom_libs[i].img != img) continue;
+    if (!g_custom_libs[i].in_use || g_custom_libs[i].img != img) continue;
 
     if (g_custom_libs[i].eh_frame_registered) {
       __deregister_frame(g_custom_libs[i].eh_frame_registered);
