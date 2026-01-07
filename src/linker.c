@@ -312,12 +312,8 @@ void linker_abandon(struct linker *linker) {
       unregister_custom_library_for_backtrace(dep->img);
     }
 
-    void *dep_base = dep->map_base;
-    size_t dep_map_size = dep->map_size;
-
     csoloader_elf_destroy(dep->img);
     dep->img = NULL;
-    dep->map_base = NULL;
     dep->map_size = 0;
   }
 
@@ -325,9 +321,6 @@ void linker_abandon(struct linker *linker) {
     unregister_eh_frame_for_library(linker->img);
     unregister_custom_library_for_backtrace(linker->img);
   }
-
-  void *main_base = linker->img->base;
-  size_t main_map_size = linker->main_map_size;
 
   csoloader_elf_destroy(linker->img);
   linker->img = NULL;
