@@ -514,10 +514,17 @@ void register_eh_frame_for_library(struct csoloader_elf *img) {
       return;
     }
 
-    __register_frame(eh_frame_ptr);
-    LOGD("Registered .eh_frame at %p (size ~%zu) for %s", eh_frame_ptr, eh_frame_size, img->elf);
+    LOGD("Registering .eh_frame at %p (size ~%zu) for %s", eh_frame_ptr, eh_frame_size, img->elf);
 
-    /* Store for deregistration */
+    if (__register_frame) {
+      __register_frame(eh_frame_ptr);
+      LOGD("Registered .eh_frame at %p (size ~%zu) for %s", eh_frame_ptr, eh_frame_size, img->elf);
+    } else {
+      LOGW("__register_frame not available; skipping .eh_frame registration for %s", img->elf);
+      return;
+    }
+
+    /* INFO: Store for deregistration */
     pthread_mutex_lock(&g_custom_libs_mutex);
     for (int i = 0; i < MAX_CUSTOM_LIBS; i++) {
       if (!g_custom_libs[i].in_use || g_custom_libs[i].img != img) continue;
