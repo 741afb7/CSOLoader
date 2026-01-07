@@ -1342,10 +1342,11 @@ static void _linker_restore_protections(struct csoloader_elf *image) {
     uintptr_t current_page = start_page_addr + (i * system_page_size);
     int final_prot = page_protections[i];
 
-    if (final_prot != 0 && mprotect((void *)current_page, system_page_size, final_prot) != 0)
+    if (final_prot != 0 && mprotect((void *)current_page, system_page_size, final_prot) != 0) {
       LOGW("mprotect failed to restore prot %d for page %p in %s: %s", final_prot, (void *)current_page, image->elf, strerror(errno));
-    else if (final_prot & PROT_EXEC)
+    } else if ((final_prot & PROT_EXEC) && (final_prot & PROT_READ)) {
       __builtin___clear_cache((char *)current_page, (char *)current_page + system_page_size);
+    }
   }
 
   free(page_protections);
