@@ -577,8 +577,11 @@ struct csoloader_elf *csoloader_elf_create(const char *elf, void *base) {
     LOGE("Failed to calculate bias for %s. Assuming bias is 0.", img->elf);
 
   if (!img->dynsym_start || !img->strtab_start) {
-    if (img->header->e_type == ET_DYN) LOGE("Failed to find .dynsym or its string table (.dynstr) in %s", img->elf);
-    else LOGW("No .dynsym or .dynstr found in %s (might be expected for ET_EXEC)", img->elf);
+    if (img->header->e_type == ET_DYN) {
+      LOGE("Failed to find .dynsym or its string table (.dynstr) in %s", img->elf);
+    } else {
+      LOGW("No .dynsym or .dynstr found in %s (might be expected for ET_EXEC)", img->elf);
+    }
   }
 
   if (!img->gnu_bucket_ && !img->bucket_)
