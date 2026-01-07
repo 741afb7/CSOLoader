@@ -260,6 +260,12 @@ bool linker_init(struct linker *linker, struct csoloader_elf *img) {
 }
 
 void linker_destroy(struct linker *linker) {
+  if (linker->is_linked) {
+    unregister_eh_frame_for_library(linker->img);
+    unregister_custom_library_for_backtrace(linker->img);
+    _linker_call_destructors(linker->img);
+  }
+
   for (int i = linker->dep_count - 1; i >= 0; --i) {
     struct loaded_dep *dep = &linker->dependencies[i];
     if (!dep->img) continue;
@@ -270,22 +276,15 @@ void linker_destroy(struct linker *linker) {
       _linker_call_destructors(dep->img);
     }
 
-    void *dep_base = dep->map_base;
+    void *dep_base = dep->img->base;
     size_t dep_map_size = dep->map_size;
 
     csoloader_elf_destroy(dep->img);
     dep->img = NULL;
-    dep->map_base = NULL;
     dep->map_size = 0;
 
     if (dep->is_manual_load && dep_map_size > 0)
       munmap(dep_base, dep_map_size);
-  }
-
-  if (linker->img && linker->is_linked) {
-    unregister_eh_frame_for_library(linker->img);
-    unregister_custom_library_for_backtrace(linker->img);
-    _linker_call_destructors(linker->img);
   }
 
   void *main_base = linker->img->base;
@@ -505,7 +504,6 @@ void *linker_load_library_manually(const char *lib_path, struct loaded_dep *out)
   close(fd);
 
   out->is_manual_load = true;
-  out->map_base = base;
   out->load_bias = bias;
 
   free(phdr);
